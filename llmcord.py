@@ -2,6 +2,7 @@ import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
+import io
 import logging
 import os
 import random
@@ -15,6 +16,7 @@ from discord.ui import LayoutView, TextDisplay
 from dotenv import load_dotenv
 import httpx
 from openai import AsyncOpenAI
+from PIL import Image
 import yaml
 
 load_dotenv()
@@ -34,6 +36,9 @@ EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
 
+GIF_MAX_FRAMES = 4  # how many frames to pull from an animated GIF
+GIF_MAX_SIZE = 768  # longest side in pixels for each extracted frame
+
 
 def resolve_env(node: Any) -> Any:
     if isinstance(node, dict):
@@ -44,6 +49,27 @@ def resolve_env(node: Any) -> Any:
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
     with open(filename, encoding="utf-8") as file:
         return resolve_env(yaml.safe_load(file))
+
+
+def gif_to_png_frames(data: bytes, max_frames: int = GIF_MAX_FRAMES) -> list[bytes]:
+    """Return up to max_frames PNG frames spread evenly across a GIF."""
+    frames = []
+
+    with Image.open(io.BytesIO(data)) as gif:
+        total = getattr(gif, "n_frames", 1)
+        count = min(max_frames, total)
+        indexes = sorted({round(i * (total - 1) / max(count - 1, 1)) for i in range(count)})
+
+        for index in indexes:
+            gif.seek(index)
+            frame = gif.convert("RGB")
+            frame.thumbnail((GIF_MAX_SIZE, GIF_MAX_SIZE))
+
+            buffer = io.BytesIO()
+            frame.save(buffer, format="PNG")
+            frames.append(buffer.getvalue())
+
+    return frames
 
 
 config = get_config()
@@ -220,11 +246,25 @@ async def on_message(new_msg: discord.Message) -> None:
                     + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
                 )
 
-                curr_node.images = [
-                    dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
-                    for att, resp in zip(good_attachments, attachment_responses)
-                    if att.content_type.startswith("image")
-                ]
+                curr_node.images = []
+
+                for att, resp in zip(good_attachments, attachment_responses):
+                    if not att.content_type.startswith("image"):
+                        continue
+
+                    # Ollama can't read GIFs, so send a few still frames instead
+                    if att.content_type == "image/gif":
+                        try:
+                            gif_frames = await asyncio.to_thread(gif_to_png_frames, resp.content)
+                            curr_node.images += [
+                                dict(type="image_url", image_url=dict(url=f"data:image/png;base64,{b64encode(frame).decode('utf-8')}"))
+                                for frame in gif_frames
+                            ]
+                            continue
+                        except Exception:
+                            logging.exception("Couldn't convert GIF to frames, sending it as-is")
+
+                    curr_node.images.append(dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}")))
 
                 if curr_node.role == "user" and (curr_node.text or curr_node.images):
                     curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"

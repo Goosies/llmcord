@@ -3,3 +3,4 @@ httpx
 openai
 python-dotenv
 pyyaml
+pillow
