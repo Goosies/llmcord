@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import os
+import random
+import time
 from typing import Any, Literal, Optional
 
 import discord
@@ -49,6 +51,7 @@ curr_model = next(iter(config["models"]))
 
 msg_nodes = {}
 last_task_time = 0
+last_random_reply = 0.0
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -113,17 +116,42 @@ async def on_ready() -> None:
 
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
-    global last_task_time
+    global last_task_time, last_random_reply
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
 
-    if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
+    if new_msg.author.bot:
+        return
+
+    config = await asyncio.to_thread(get_config)
+
+    # Random chime-ins: occasionally reply to messages that don't @ the bot
+    random_cfg = config.get("random_replies") or {}
+    random_trigger = False
+
+    if not is_dm and discord_bot.user not in new_msg.mentions and random_cfg.get("enabled"):
+        random_channel_ids = random_cfg.get("channel_ids") or []
+        in_random_channel = (
+            not random_channel_ids
+            or new_msg.channel.id in random_channel_ids
+            or getattr(new_msg.channel, "parent_id", None) in random_channel_ids
+        )
+        now_ts = time.time()
+
+        if (
+            in_random_channel
+            and new_msg.content
+            and now_ts - last_random_reply >= random_cfg.get("cooldown_seconds", 600)
+            and random.random() < random_cfg.get("chance", 0.03)
+        ):
+            random_trigger = True
+            last_random_reply = now_ts
+
+    if not is_dm and discord_bot.user not in new_msg.mentions and not random_trigger:
         return
 
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
     channel_ids = set(filter(None, (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None))))
-
-    config = await asyncio.to_thread(get_config)
 
     allow_dms = config.get("allow_dms", True)
 
@@ -245,12 +273,39 @@ async def on_message(new_msg: discord.Message) -> None:
 
             curr_msg = curr_node.parent_msg
 
-    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+    if random_trigger:
+        # Use the recent channel chat as context instead of a reply chain
+        messages = [dict(role="user", content=f"<@{new_msg.author.id}>: {new_msg.content}"[:max_text])]
+        user_warnings.clear()
+
+        async for past_msg in new_msg.channel.history(limit=random_cfg.get("context_messages", 8), before=new_msg):
+            past_text = "\n".join(
+                filter(
+                    None,
+                    [past_msg.content]
+                    + [embed.description for embed in past_msg.embeds]
+                    + [component.content for component in past_msg.components if component.type == discord.ComponentType.text_display],
+                )
+            )
+            if not past_text:
+                continue
+
+            if past_msg.author == discord_bot.user:
+                messages.append(dict(role="assistant", content=past_text[:max_text]))
+            else:
+                messages.append(dict(role="user", content=f"<@{past_msg.author.id}>: {past_text}"[:max_text]))
+
+        messages = messages[:max_messages]
+
+    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}, random chime-in: {random_trigger}):\n{new_msg.content}")
 
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
 
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+
+        if random_trigger:
+            system_prompt += "\n\nNobody @'d you. You are chiming into this chat on your own. React naturally to the latest message, stay in character, and keep it to one or two short sentences."
 
         messages.append(dict(role="system", content=system_prompt))
 
