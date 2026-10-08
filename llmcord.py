@@ -678,8 +678,13 @@ async def on_message(new_msg: discord.Message) -> None:
 
         messages = messages[:max_messages]
 
-    if switch_models and not any(isinstance(m["content"], list) for m in messages):
+    # Only an image in the new message (or the one it replies to) needs the vision model.
+    # Older images in the chain become a text note so the fast text model can handle the rest.
+    if switch_models and not any(isinstance(m["content"], list) for m in messages[:2]):
         provider_slash_model = switch_models[0]
+        for m in messages:
+            if isinstance(m["content"], list):
+                m["content"] = (m["content"][0].get("text", "") + " (sent an image)").strip()
 
     llm = resolve_model(config, provider_slash_model)
     openai_client, model = llm.client, llm.model
