@@ -8,6 +8,6 @@ COPY requirements.txt ./
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY llmcord.py learning.py config.yaml ./
+COPY llmcord.py learning.py barowiki.py config.yaml ./
 
 CMD ["python", "llmcord.py"]

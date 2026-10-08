@@ -11,6 +11,7 @@ max_messages: 10
 
 use_plain_responses: false
 allow_dms: true
+reply_without_mention: true  # replying to the bot's message counts as talking to it, even with the ping off
 
 permissions:
   users:
@@ -75,6 +76,31 @@ media:                    # the bot remembers gifs/images/videos people post and
   save_files: true        # keep copies of files uploaded to Discord (their links expire after a day)
   max_file_mb: 8
   max_total_mb: 1000
+
+reactions:                # the bot reacts with the server's favorite emoji
+  enabled: true
+  chance: 0.05            # chance to react (no reply) to a message nobody aimed at it
+  cooldown_seconds: 300   # minimum gap between those reaction-only chime-ins
+  offer_chance: 0.35      # how often it may also react to messages it replies to
+  options: 8              # how many of the server's favorite emoji it picks from
+
+mood:                     # time of day, how busy chat is, and a mood based on how people treat it
+  enabled: true
+
+recall:                   # "remember when..." - brings up old moments related to what's being said
+  enabled: true
+  embedding_model: ollama/nomic-embed-text  # run: ollama pull nomic-embed-text (leave blank for keyword matching)
+  min_similarity: 0.6     # how closely an old moment must match to be brought up
+  max_moments: 2
+  min_age_hours: 6        # only recall things older than this
+
+wiki:                     # looks up real Barotrauma questions on the official wiki
+  enabled: true
+
+auto_switch:              # fast text model normally, vision model only when there's an image
+  enabled: false
+  text_model: ollama/llama3.1:8b
+  vision_model: ollama/gemma4:12b-it-qat
 
 providers:
   ollama:

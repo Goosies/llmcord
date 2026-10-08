@@ -12,10 +12,13 @@ Everything is stored locally in data/memory.db (plus data/media/ for saved
 files). Nothing leaves the computer the bot runs on.
 """
 
+from array import array
 import asyncio
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 import logging
+import math
 import os
 import random
 import re
@@ -27,6 +30,11 @@ from urllib.parse import urlparse
 import discord
 import httpx
 
+try:
+    import numpy
+except ImportError:  # optional, only makes memory recall faster
+    numpy = None
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "memory.db")
@@ -34,6 +42,8 @@ MEDIA_DIR = os.path.join(DATA_DIR, "media")
 
 URL_RE = re.compile(r"https?://[^\s<>]+")
 MEDIA_TAG_RE = re.compile(r"\[\s*media\s*[:#]?\s*(\d+)\s*\]", re.IGNORECASE)
+REACT_TAG_RE = re.compile(r"\[\s*react\s*[:#]?\s*(\d+)\s*\]", re.IGNORECASE)
+CUSTOM_EMOJI_RE = re.compile(r"<a?:(\w+):(\d+)>")
 WORD_RE = re.compile(r"[a-z0-9']+")
 TOKEN_RE = re.compile(r"[a-z][a-z0-9']*")
 EMOJI_RE = re.compile(r"<a?:\w+:\d+>|[\U0001F300-\U0001FAFF☀-➿]")
@@ -47,6 +57,13 @@ MAX_MEDIA_PER_MESSAGE = 5
 FEEDBACK_DAYS = 30
 
 Complete = Callable[[list[dict[str, str]]], Awaitable[str]]
+Embed = Callable[[list[str], str], Awaitable[list[list[float]]]]  # (texts, "document" | "query") -> vectors
+
+DEFAULT_REACTIONS = ["💀", "😭", "😂", "🫡", "👀", "🔥"]
+MOMENT_WINDOW = 8  # max messages per remembered moment
+MOMENT_GAP_SECONDS = 900  # a pause this long starts a new moment
+MOMENT_SETTLE_SECONDS = 600  # wait this long so a conversation is finished before saving it
+MOMENTS_EVERY = 20  # save new moments after this many unsaved messages
 
 DISCORD_CDN_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
 
@@ -96,6 +113,14 @@ class LearnResult:
     lore_due: bool = False
     persona_due: bool = False
     person_due: bool = False
+    moments_due: bool = False
+
+
+@dataclass
+class LearnedContext:
+    text: str = ""
+    media: dict[int, Any] = field(default_factory=dict)
+    reactions: list[str] = field(default_factory=list)
 
 
 _media_bytes: Optional[int] = None
@@ -103,6 +128,8 @@ _running: set[tuple] = set()
 _last_attempt: dict[tuple, float] = {}
 _optouts: set[tuple[int, int]] = set()
 _habits_cache: dict[int, tuple[float, str]] = {}
+_moment_cache: dict[int, list[tuple]] = {}
+_embed_failed_logged = False
 _llm_lock = asyncio.Lock()
 
 
@@ -149,7 +176,8 @@ def init_db() -> None:
                 author_name TEXT,
                 content TEXT,
                 created_at REAL,
-                to_bot INTEGER DEFAULT 0
+                to_bot INTEGER DEFAULT 0,
+                chunked INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_messages_guild ON messages (guild_id, id);
             CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages (channel_id, id);
@@ -214,13 +242,31 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS optouts (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id));
+
+            CREATE TABLE IF NOT EXISTS emoji_usage (guild_id INTEGER, emoji TEXT, count INTEGER DEFAULT 0, PRIMARY KEY (guild_id, emoji));
+
+            CREATE TABLE IF NOT EXISTS moments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                channel_id INTEGER,
+                start_id INTEGER,
+                end_id INTEGER,
+                author_ids TEXT,
+                text TEXT,
+                embedding BLOB,
+                created_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_moments_guild ON moments (guild_id, created_at);
             """
         )
 
-        # Databases made by the first version of this file don't have to_bot yet
+        # Databases made by older versions of this file are missing these columns
         columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
         if "to_bot" not in columns:
             conn.execute("ALTER TABLE messages ADD COLUMN to_bot INTEGER DEFAULT 0")
+        if "chunked" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN chunked INTEGER DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_unchunked ON messages (guild_id, chunked, created_at)")
 
         conn.commit()
         _optouts.clear()
@@ -500,10 +546,15 @@ async def learn_from_message(msg: Any, config: dict[str, Any], http_client: http
     if media_cfg.get("enabled"):
         result.media_saved = await _save_media(msg, text, media_cfg, http_client)
 
+    # Track which emoji people use in their messages
+    for emoji in EMOJI_RE.findall(msg.content or ""):
+        await record_emoji_use(guild_id, emoji)
+
     if learn_cfg.get("enabled") and result.stored_text:
         result.lore_due = await _lore_due(guild_id, learn_cfg)
         result.persona_due = await _persona_due(guild_id, config)
         result.person_due = await _person_due(guild_id, msg.author.id, config)
+        result.moments_due = await _moments_due(guild_id, config)
 
     return result
 
@@ -586,8 +637,15 @@ async def update_media_from_embeds(msg: Any) -> None:
 
 
 async def forget_messages(message_ids: list[int]) -> None:
-    """Remove deleted messages and their saved media, so deleted stuff never gets reposted."""
+    """Remove deleted messages and their saved media, so deleted stuff never gets reposted or recalled."""
     for message_id in message_ids:
+        if stored := await _adb("SELECT guild_id, channel_id FROM messages WHERE id = ?", (message_id,), "one"):
+            await _adb(
+                "DELETE FROM moments WHERE channel_id = ? AND start_id <= ? AND end_id >= ?",
+                (stored["channel_id"], message_id, message_id),
+            )
+            _moment_cache.pop(stored["guild_id"], None)
+
         rows = await _adb("SELECT file_path FROM media WHERE message_id = ?", (message_id,), "all") or []
         for row in rows:
             _remove_file(row["file_path"])
@@ -808,7 +866,6 @@ async def evolve_persona(guild_id: int, config: dict[str, Any], complete: Comple
     """Let the bot's personality drift toward how this server talks and treats it."""
 
     async def job() -> bool:
-        persona_cfg = config.get("persona") or {}
         current = await get_persona(guild_id, config) or "(no personality written yet)"
 
         chat = await _adb("SELECT author_name, content FROM messages WHERE guild_id = ? ORDER BY id DESC LIMIT 150", (guild_id,), "all")
@@ -970,6 +1027,8 @@ async def forget_person(guild_id: int, user_id: int) -> None:
 
     await _adb("DELETE FROM media WHERE guild_id = ? AND author_id = ?", (guild_id, user_id))
     await _adb("DELETE FROM messages WHERE guild_id = ? AND author_id = ?", (guild_id, user_id))
+    await _adb("DELETE FROM moments WHERE guild_id = ? AND author_ids LIKE ?", (guild_id, f"%,{user_id},%"))
+    _moment_cache.pop(guild_id, None)
     await _adb("DELETE FROM people WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
     await _adb("DELETE FROM facts WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
     await _adb(
@@ -987,6 +1046,282 @@ async def opt_back_in(guild_id: int, user_id: int) -> None:
 
 def is_opted_out(guild_id: int, user_id: int) -> bool:
     return (guild_id, user_id) in _optouts
+
+
+# ---------------------------------------------------------------- emoji
+
+
+async def record_emoji_use(guild_id: int, emoji: str) -> None:
+    await _adb(
+        "INSERT INTO emoji_usage (guild_id, emoji, count) VALUES (?, ?, 1) ON CONFLICT (guild_id, emoji) DO UPDATE SET count = count + 1",
+        (guild_id, _normalize_emoji(emoji)),
+    )
+
+
+async def get_server_emoji(guild_id: int, usable_custom_ids: Optional[set[int]] = None, limit: int = 8) -> list[str]:
+    """The server's favorite emoji (from messages and reactions), limited to ones the bot can actually use."""
+    usable_custom_ids = usable_custom_ids or set()
+    rows = await _adb("SELECT emoji, count FROM emoji_usage WHERE guild_id = ? ORDER BY count DESC LIMIT 100", (guild_id,), "all")
+
+    favorites = []
+    for row in rows:
+        if custom := CUSTOM_EMOJI_RE.fullmatch(row["emoji"]):
+            if int(custom.group(2)) not in usable_custom_ids:
+                continue
+        favorites.append(row["emoji"])
+        if len(favorites) >= limit:
+            break
+
+    for emoji in DEFAULT_REACTIONS:
+        if len(favorites) >= max(4, min(limit, 6)):
+            break
+        if emoji not in favorites:
+            favorites.append(emoji)
+
+    return favorites
+
+
+def emoji_label(emoji: str) -> str:
+    """How an emoji is shown to the model: custom ones by name."""
+    return f":{custom.group(1)}:" if (custom := CUSTOM_EMOJI_RE.fullmatch(emoji)) else emoji
+
+
+def chosen_reaction(text: str, options: list[str]) -> Optional[str]:
+    for match in REACT_TAG_RE.finditer(text):
+        if 1 <= (number := int(match.group(1))) <= len(options):
+            return options[number - 1]
+    return None
+
+
+def reaction_prompt(bot_name: str, author_name: str, text: str, options: list[str]) -> list[dict[str, str]]:
+    """Tiny prompt for reaction-only chime-ins."""
+    numbered = "\n".join(f"{i}. {emoji_label(e)}" for i, e in enumerate(options, 1))
+    return [
+        dict(role="system", content=f"You are {bot_name}, a regular in a Discord friend group. You react to messages with emoji like a friend would."),
+        dict(role="user", content=f'{author_name} just said: "{text[:400]}"\n\nWhich emoji reaction fits best?\n{numbered}\n\nAnswer with only the number, or 0 if none fit.'),
+    ]
+
+
+def parse_reaction_choice(output: str, options: list[str]) -> Optional[str]:
+    if match := re.search(r"\d+", output or ""):
+        if 1 <= (number := int(match.group())) <= len(options):
+            return options[number - 1]
+    return None
+
+
+# ---------------------------------------------------------------- mood and time
+
+
+def time_of_day(now: datetime) -> str:
+    hour = now.hour
+    if hour < 5:
+        return "late night"
+    if hour < 9:
+        return "early morning"
+    if hour < 12:
+        return "morning"
+    if hour < 17:
+        return "afternoon"
+    if hour < 21:
+        return "evening"
+    return "night"
+
+
+async def mood_section(guild_id: int, channel_id: int, now: datetime, current_message_id: Optional[int] = None) -> str:
+    """Time of day, how busy chat is, and a mood based on how people have been treating the bot."""
+    t = time.time()
+    clock = f"{now.hour % 12 or 12}:{now.minute:02d} {'AM' if now.hour < 12 else 'PM'}"
+    label = time_of_day(now)
+    lines = [f"Right now it's {now.strftime('%A')} {label} ({clock})."]
+    if label == "late night":
+        lines.append("It's really late. You can act tired or call people out for still being up.")
+
+    busy = await _adb("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND created_at > ?", (channel_id, t - 600), "one")
+    previous = await _adb(
+        "SELECT created_at FROM messages WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
+        (channel_id, current_message_id or (1 << 62)),
+        "one",
+    )
+    if busy["n"] >= 15:
+        lines.append(f"Chat is busy right now ({busy['n']} messages in the last 10 minutes).")
+    elif previous and (gap_hours := (t - previous["created_at"]) / 3600) >= 3:
+        lines.append(f"Chat was dead for about {round(gap_hours)} hours before this.")
+
+    feedback = await _adb(
+        "SELECT COALESCE(SUM(f.weight), 0) AS score, SUM(CASE WHEN f.weight < 0 THEN 1 ELSE 0 END) AS negative "
+        "FROM feedback f JOIN bot_messages b ON b.id = f.message_id WHERE b.guild_id = ? AND f.created_at > ?",
+        (guild_id, t - 3 * 3600),
+        "one",
+    )
+    to_bot = await _adb("SELECT content, created_at FROM messages WHERE guild_id = ? AND to_bot = 1 AND created_at > ?", (guild_id, t - 12 * 3600), "all")
+    roasts = sum(1 for row in to_bot if row["created_at"] > t - 3 * 3600 and NEGATIVE_RE.search(row["content"]))
+    score = (feedback["score"] or 0) - 2 * roasts
+
+    if roasts + (feedback["negative"] or 0) >= 3 and score < 0:
+        mood = "grumpy: people have been roasting you or telling you to shut up. Let it show a little (salty, defensive) without overdoing it"
+    elif score >= 6:
+        mood = "in a great mood: your jokes have been landing. A bit more playful than usual"
+    elif score >= 2:
+        mood = "in a good mood"
+    elif not to_bot:
+        mood = "a little bored: nobody's talked to you in a while. You're glad someone's talking to you, even if you won't admit it"
+    else:
+        mood = ""
+
+    if label == "late night":
+        mood = f"{mood}, and tired" if mood else "tired"
+    if mood:
+        lines.append(f"Your mood: {mood}.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- remembered moments ("remember when...")
+
+
+async def _moments_due(guild_id: int, config: dict[str, Any]) -> bool:
+    if not (config.get("recall") or {}).get("enabled") or _job_blocked(("moments", guild_id)):
+        return False
+    row = await _adb(
+        "SELECT COUNT(*) AS n FROM messages WHERE guild_id = ? AND chunked = 0 AND created_at < ?",
+        (guild_id, time.time() - MOMENT_SETTLE_SECONDS),
+        "one",
+    )
+    return row["n"] >= MOMENTS_EVERY
+
+
+async def _embed_safely(embed: Optional[Embed], texts: list[str], kind: str) -> Optional[list[list[float]]]:
+    global _embed_failed_logged
+    if not embed or not texts:
+        return None
+    try:
+        vectors = []
+        for start in range(0, len(texts), 32):
+            vectors += await embed(texts[start : start + 32], kind)
+        return vectors
+    except Exception:
+        if not _embed_failed_logged:
+            logging.exception("Embedding model unavailable, falling back to keyword memory search")
+            _embed_failed_logged = True
+        return None
+
+
+async def save_moments(guild_id: int, embed: Optional[Embed], force: bool = False) -> bool:
+    """Group finished conversations into moments the bot can recall later."""
+
+    async def job() -> bool:
+        rows = await _adb(
+            "SELECT id, channel_id, author_id, author_name, content, created_at FROM messages "
+            "WHERE guild_id = ? AND chunked = 0 AND created_at < ? ORDER BY channel_id, id LIMIT 5000",
+            (guild_id, time.time() - MOMENT_SETTLE_SECONDS),
+            "all",
+        )
+        if not rows:
+            return False
+
+        groups, current = [], []
+        for row in rows:
+            if current and (
+                row["channel_id"] != current[-1]["channel_id"]
+                or row["created_at"] - current[-1]["created_at"] > MOMENT_GAP_SECONDS
+                or len(current) >= MOMENT_WINDOW
+            ):
+                groups.append(current)
+                current = []
+            current.append(row)
+        groups.append(current)
+
+        moments = [g for g in groups if len(g) >= 3 or sum(len(r["content"]) for r in g) >= 120]
+        texts = ["\n".join(f"{r['author_name']}: {r['content'][:300]}" for r in g) for g in moments]
+        vectors = await _embed_safely(embed, texts, "document")
+
+        for index, (group, text) in enumerate(zip(moments, texts)):
+            blob = array("f", vectors[index]).tobytes() if vectors else None
+            author_ids = "," + ",".join(str(a) for a in dict.fromkeys(r["author_id"] for r in group)) + ","
+            await _adb(
+                "INSERT INTO moments (guild_id, channel_id, start_id, end_id, author_ids, text, embedding, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (guild_id, group[0]["channel_id"], group[0]["id"], group[-1]["id"], author_ids, text, blob, group[-1]["created_at"]),
+            )
+
+        ids = [row["id"] for row in rows]
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            await _adb(f"UPDATE messages SET chunked = 1 WHERE id IN ({','.join('?' * len(batch))})", tuple(batch))
+
+        _moment_cache.pop(guild_id, None)
+        logging.info(f"Saved {len(moments)} moments for guild {guild_id}")
+        return True
+
+    return await _run_job(("moments", guild_id), force, job)
+
+
+async def _load_moments(guild_id: int) -> list[tuple]:
+    if guild_id not in _moment_cache:
+        rows = await _adb("SELECT id, created_at, text, embedding FROM moments WHERE guild_id = ?", (guild_id,), "all")
+        loaded = []
+        for row in rows:
+            vector = norm = None
+            if row["embedding"]:
+                vector = array("f")
+                vector.frombytes(row["embedding"])
+                if numpy is not None:
+                    vector = numpy.frombuffer(row["embedding"], dtype=numpy.float32)
+                    norm = float(numpy.linalg.norm(vector)) or 1.0
+                else:
+                    norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+            loaded.append((row["id"], row["created_at"], row["text"], vector, norm))
+        _moment_cache[guild_id] = loaded
+    return _moment_cache[guild_id]
+
+
+def _cosine(query: Any, query_norm: float, vector: Any, norm: float) -> float:
+    if numpy is not None and isinstance(vector, numpy.ndarray):
+        return float(numpy.dot(query, vector)) / (query_norm * norm)
+    return sum(a * b for a, b in zip(query, vector)) / (query_norm * norm)
+
+
+def _ago(created_at: float) -> str:
+    days = (time.time() - created_at) / 86400
+    if days < 1:
+        return "earlier today"
+    if days < 2:
+        return "yesterday"
+    if days < 14:
+        return f"{round(days)} days ago"
+    if days < 60:
+        return f"about {round(days / 7)} weeks ago"
+    return f"about {round(days / 30)} months ago"
+
+
+async def recall_moments(guild_id: int, query: str, recall_cfg: dict[str, Any], embed: Optional[Embed]) -> list[tuple[float, str]]:
+    """Find old moments related to what's being said now. Uses embeddings, or keywords as a fallback."""
+    if not query.strip():
+        return []
+
+    cutoff = time.time() - recall_cfg.get("min_age_hours", 6) * 3600
+    candidates = [m for m in await _load_moments(guild_id) if m[1] < cutoff]
+    if not candidates:
+        return []
+
+    scored = []
+    embedded = [m for m in candidates if m[3] is not None]
+    query_vectors = await _embed_safely(embed, [query], "query") if embedded else None
+
+    if query_vectors:
+        query_vector = numpy.asarray(query_vectors[0], dtype=numpy.float32) if numpy is not None else query_vectors[0]
+        query_norm = math.sqrt(sum(v * v for v in query_vectors[0])) or 1.0
+        threshold = recall_cfg.get("min_similarity", 0.6)
+        for moment in embedded:
+            if len(moment[3]) == len(query_vectors[0]) and (score := _cosine(query_vector, query_norm, moment[3], moment[4])) >= threshold:
+                scored.append((score, moment))
+    else:
+        query_words = words(query)
+        for moment in candidates:
+            if (overlap := len(query_words & words(moment[2]))) >= recall_cfg.get("min_keyword_overlap", 3):
+                scored.append((overlap, moment))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [(moment[1], moment[2]) for _, moment in scored[: recall_cfg.get("max_moments", 2)]]
 
 
 # ---------------------------------------------------------------- using what was learned
@@ -1051,23 +1386,42 @@ async def _roster_section(guild_id: int, size: int) -> str:
     return "Regulars here (use <@ID> to mention them): " + ", ".join(f"{names[user_id]} = <@{user_id}>" for user_id in regulars)
 
 
-async def build_context(guild_id: int, query: str, config: dict[str, Any], participant_ids: Optional[list[int]] = None) -> tuple[str, dict[int, Any]]:
-    """Return extra system-prompt text, plus the media the bot is allowed to send this time."""
+async def build_context(
+    guild_id: int,
+    query: str,
+    config: dict[str, Any],
+    participant_ids: Optional[list[int]] = None,
+    *,
+    channel_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    now: Optional[datetime] = None,
+    usable_emoji_ids: Optional[set[int]] = None,
+    embed: Optional[Embed] = None,
+    extra_sections: Optional[list[tuple[int, str]]] = None,
+) -> LearnedContext:
+    """Build the extra system-prompt text, plus the media and reactions the bot may use this time."""
     learn_cfg = config.get("learning") or {}
     persona_cfg = config.get("persona") or {}
     people_cfg = config.get("people") or {}
     feedback_cfg = config.get("feedback") or {}
     media_cfg = config.get("media") or {}
+    reactions_cfg = config.get("reactions") or {}
+    mood_cfg = config.get("mood") or {}
+    recall_cfg = config.get("recall") or {}
 
     # (priority, text): when over budget, the lowest priority sections are dropped first
-    sections: list[tuple[int, str]] = []
-    offered: dict[int, Any] = {}
+    sections: list[tuple[int, str]] = list(extra_sections or [])
+    result = LearnedContext()
 
     if persona_cfg.get("enabled"):
         if traits := await get_persona(guild_id, config):
             sections.append((100, f"Your personality (it keeps growing from hanging out with this crew):\n{traits}"))
         if guardrails := persona_cfg.get("guardrails"):
             sections.append((1000, "Always, no matter how your personality changes:\n" + "\n".join(f"- {rule}" for rule in guardrails)))
+
+    if mood_cfg.get("enabled") and channel_id is not None:
+        if mood := await mood_section(guild_id, channel_id, now or datetime.now().astimezone(), message_id):
+            sections.append((88, mood))
 
     if learn_cfg.get("enabled"):
         if learn_cfg.get("speech_habits", True) and (habits := await get_speech_habits(guild_id)):
@@ -1085,6 +1439,13 @@ async def build_context(guild_id: int, query: str, config: dict[str, Any], parti
                      + "\n".join(f"{row['author_name']}: {row['content']}" for row in sample))
                 )
 
+    if recall_cfg.get("enabled") and (moments := await recall_moments(guild_id, query, recall_cfg, embed)):
+        sections.append(
+            (65, "Old moments from this server that relate to what's being said. You can call back to one like you remember it "
+             "(\"this is the reactor thing all over again\"), but only if it really fits:\n"
+             + "\n\n".join(f"[{_ago(created_at)}]\n{text}" for created_at, text in moments))
+        )
+
     if people_cfg.get("enabled"):
         if people := await _people_section(guild_id, participant_ids or [], people_cfg):
             sections.append((80, people))
@@ -1094,31 +1455,45 @@ async def build_context(guild_id: int, query: str, config: dict[str, Any], parti
     if feedback_cfg.get("enabled") and (hits := await get_hits(guild_id, feedback_cfg.get("show_hits", 4))):
         sections.append((60, "Your lines that got big laughs here. That's the humor that lands; don't repeat them word for word:\n" + "\n".join(f"- {h}" for h in hits)))
 
+    media_section = reaction_section = None
     if media_cfg.get("enabled") and random.random() < media_cfg.get("offer_chance", 0.4):
         if rows := await _pick_media(guild_id, query, media_cfg.get("candidates", 8), media_cfg.get("reuse_cooldown_hours", 12)):
-            offered = {row["id"]: row for row in rows}
-            sections.append(
-                (50, "You can send ONE reaction gif, image or video that people here posted before, but only if it genuinely fits. "
-                 "Most replies shouldn't have one. To send it, end your reply with its tag, like [media:12]. Options:\n"
-                 + "\n".join(f"[media:{row['id']}] {row['kind']}: {_media_label(row)}" for row in rows))
+            result.media = {row["id"]: row for row in rows}
+            media_section = (
+                "You can send ONE reaction gif, image or video that people here posted before, but only if it genuinely fits. "
+                "Most replies shouldn't have one. To send it, end your reply with its tag, like [media:12]. Options:\n"
+                + "\n".join(f"[media:{row['id']}] {row['kind']}: {_media_label(row)}" for row in rows)
             )
+            sections.append((50, media_section))
+
+    if reactions_cfg.get("enabled") and random.random() < reactions_cfg.get("offer_chance", 0.35):
+        result.reactions = await get_server_emoji(guild_id, usable_emoji_ids, reactions_cfg.get("options", 8))
+        reaction_section = (
+            "You can also react to their message with an emoji, like people here do. To react, put [react:N] at the end of your reply, "
+            "using a number from this list: " + ", ".join(f"{i} {emoji_label(e)}" for i, e in enumerate(result.reactions, 1))
+        )
+        sections.append((45, reaction_section))
 
     # Fit inside the budget, dropping low-priority sections first
     budget = learn_cfg.get("max_context_chars", 7000)
     kept, used = [], 0
     for priority, text in sorted(sections, key=lambda item: item[0], reverse=True):
         if priority < 1000 and used + len(text) > budget:
-            if text.startswith("You can send ONE"):
-                offered = {}
+            if text is media_section:
+                result.media = {}
+            if text is reaction_section:
+                result.reactions = []
             continue
         kept.append(text)
         used += len(text)
 
-    return "\n\n".join(kept), offered
+    result.text = "\n\n".join(kept)
+    return result
 
 
 def strip_media_tags(text: str) -> str:
-    text = MEDIA_TAG_RE.sub("", text)
+    """Remove [media:N] and [react:N] tags before a reply is shown."""
+    text = REACT_TAG_RE.sub("", MEDIA_TAG_RE.sub("", text))
     return re.sub(r"[ \t]+\n", "\n", text).strip()
 
 

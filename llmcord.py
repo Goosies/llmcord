@@ -22,6 +22,7 @@ from openai import AsyncOpenAI
 from PIL import Image
 import yaml
 
+import barowiki
 import learning
 
 load_dotenv()
@@ -128,6 +129,7 @@ curr_model = next(iter(config["models"]))
 msg_nodes = {}
 last_task_time = 0
 last_random_reply = 0.0
+last_reaction_time: dict[int, float] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -146,25 +148,87 @@ def run_in_background(coro) -> None:
     task.add_done_callback(background_tasks.discard)
 
 
-async def simple_completion(prompt_messages: list[dict[str, str]]) -> str:
-    """One-off, non-streamed request (used for background learning: notes, personality, people)."""
-    cfg = await asyncio.to_thread(get_config)
-    provider_slash_model = (cfg.get("learning") or {}).get("background_model") or curr_model
+@dataclass
+class ResolvedModel:
+    name: str
+    client: AsyncOpenAI
+    model: str
+    extra_headers: Optional[dict[str, Any]]
+    extra_query: Optional[dict[str, Any]]
+    extra_body: Optional[dict[str, Any]]
+
+
+def resolve_model(cfg: dict[str, Any], provider_slash_model: str) -> ResolvedModel:
     provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
     provider_config = cfg["providers"][provider]
-
-    client = AsyncOpenAI(base_url=provider_config["base_url"], api_key=provider_config.get("api_key", "sk-no-key-required"))
-    extra_body = (provider_config.get("extra_body") or {}) | (cfg["models"].get(provider_slash_model) or {}) | {"temperature": 0.4}
-
-    response = await client.chat.completions.create(
+    return ResolvedModel(
+        name=provider_slash_model,
+        client=AsyncOpenAI(base_url=provider_config["base_url"], api_key=provider_config.get("api_key", "sk-no-key-required")),
         model=model,
-        messages=prompt_messages,
-        stream=False,
         extra_headers=provider_config.get("extra_headers"),
         extra_query=provider_config.get("extra_query"),
-        extra_body=extra_body,
+        extra_body=(provider_config.get("extra_body") or {}) | (cfg["models"].get(provider_slash_model) or {}) or None,
+    )
+
+
+def auto_switch_models(cfg: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """(text model, vision model) when auto-switching is on and set up, otherwise None."""
+    switch_cfg = cfg.get("auto_switch") or {}
+    if switch_cfg.get("enabled") and switch_cfg.get("text_model") and switch_cfg.get("vision_model"):
+        return switch_cfg["text_model"], switch_cfg["vision_model"]
+    return None
+
+
+def text_model_name(cfg: dict[str, Any]) -> str:
+    return switch[0] if (switch := auto_switch_models(cfg)) else curr_model
+
+
+async def simple_completion(prompt_messages: list[dict[str, str]], max_tokens: Optional[int] = None, temperature: float = 0.4) -> str:
+    """One-off, non-streamed request (background learning, reaction picks). Uses the fast text model."""
+    cfg = await asyncio.to_thread(get_config)
+    llm = resolve_model(cfg, (cfg.get("learning") or {}).get("background_model") or text_model_name(cfg))
+
+    response = await llm.client.chat.completions.create(
+        model=llm.model,
+        messages=prompt_messages,
+        stream=False,
+        max_tokens=max_tokens,
+        extra_headers=llm.extra_headers,
+        extra_query=llm.extra_query,
+        extra_body=(llm.extra_body or {}) | {"temperature": temperature},
     )
     return response.choices[0].message.content or ""
+
+
+async def embed_texts(texts: list[str], kind: str) -> list[list[float]]:
+    """Embeddings for memory recall, from the model in recall.embedding_model (e.g. ollama/nomic-embed-text)."""
+    cfg = await asyncio.to_thread(get_config)
+    if not (name := (cfg.get("recall") or {}).get("embedding_model")):
+        raise RuntimeError("recall.embedding_model isn't set")
+
+    llm = resolve_model(cfg, name)
+    prefix = ("search_query: " if kind == "query" else "search_document: ") if "nomic" in llm.model else ""
+    response = await llm.client.embeddings.create(model=llm.model, input=[prefix + text for text in texts])
+    return [item.embedding for item in response.data]
+
+
+def usable_emoji_ids(guild: Optional[discord.Guild]) -> set[int]:
+    return {emoji.id for emoji in guild.emojis if emoji.available} if guild else set()
+
+
+async def react_in_background(msg: discord.Message, cfg: dict[str, Any]) -> None:
+    """Reaction-only chime-in: the model picks one of the server's favorite emoji, or nothing."""
+    try:
+        reactions_cfg = cfg.get("reactions") or {}
+        options = await learning.get_server_emoji(msg.guild.id, usable_emoji_ids(msg.guild), reactions_cfg.get("options", 8))
+        text = msg.clean_content.strip() or "(posted an attachment)"
+        output = await simple_completion(learning.reaction_prompt(bot_name(), msg.author.display_name, text, options), max_tokens=8, temperature=0.7)
+
+        if emoji := learning.parse_reaction_choice(output, options):
+            await msg.add_reaction(discord.PartialEmoji.from_str(emoji))
+            logging.info(f"Reacted {emoji} to message {msg.id}")
+    except Exception:
+        logging.exception("Error while picking a reaction")
 
 
 def bot_name() -> str:
@@ -180,12 +244,16 @@ async def learn_in_background(msg: discord.Message, cfg: dict[str, Any]) -> None
             await learning.evolve_persona(msg.guild.id, cfg, simple_completion, bot_name())
         if result.person_due:
             await learning.rebuild_person(msg.guild.id, msg.author.id, cfg, simple_completion, bot_name())
+        if result.moments_due:
+            await learning.save_moments(msg.guild.id, embed_texts)
     except Exception:
         logging.exception("Error while learning from message")
 
 
 async def relearn_everything(guild_id: int, cfg: dict[str, Any]) -> None:
     """Rebuild notes, personality and the regulars' profiles, one after another."""
+    if (cfg.get("recall") or {}).get("enabled"):
+        await learning.save_moments(guild_id, embed_texts, force=True)
     if (cfg.get("learning") or {}).get("enabled"):
         await learning.rebuild_lore(guild_id, cfg, simple_completion, force=True)
     if (cfg.get("persona") or {}).get("enabled"):
@@ -221,6 +289,8 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
             curr_model = model
             output = f"Model switched to: `{model}`"
             logging.info(output)
+            if auto_switch_models(config):
+                output += "\n(auto_switch is on in config.yaml, so its text/vision models are used instead)"
         else:
             output = "You don't have permission to change the model."
 
@@ -366,6 +436,9 @@ async def on_ready() -> None:
 
     await discord_bot.tree.sync()
 
+    if (config.get("wiki") or {}).get("enabled"):
+        run_in_background(barowiki.ensure_titles(httpx_client))
+
 
 @discord_bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
@@ -376,8 +449,9 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
 
 @discord_bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
-    if payload.guild_id and discord_bot.user and payload.user_id != discord_bot.user.id:
+    if payload.guild_id and discord_bot.user and payload.user_id != discord_bot.user.id and not (payload.member and payload.member.bot):
         run_in_background(learning.record_reaction(payload.message_id, payload.user_id, str(payload.emoji), payload.emoji.name or "", True))
+        run_in_background(learning.record_emoji_use(payload.guild_id, str(payload.emoji)))
 
 
 @discord_bot.event
@@ -411,11 +485,19 @@ async def on_message(new_msg: discord.Message) -> None:
     if not is_dm:
         run_in_background(learn_in_background(new_msg, config))
 
+    # Replying to one of the bot's messages counts as talking to it, even with the @ ping turned off
+    replied_to_bot = False
+    if not is_dm and new_msg.reference and config.get("reply_without_mention", True):
+        referenced = new_msg.reference.resolved or new_msg.reference.cached_message
+        replied_to_bot = getattr(referenced, "author", None) == discord_bot.user  # deleted messages have no author
+
+    directed = is_dm or discord_bot.user in new_msg.mentions or replied_to_bot
+
     # Random chime-ins: occasionally reply to messages that don't @ the bot
     random_cfg = config.get("random_replies") or {}
     random_trigger = False
 
-    if not is_dm and discord_bot.user not in new_msg.mentions and random_cfg.get("enabled"):
+    if not directed and random_cfg.get("enabled"):
         random_channel_ids = random_cfg.get("channel_ids") or []
         in_random_channel = (
             not random_channel_ids
@@ -433,7 +515,18 @@ async def on_message(new_msg: discord.Message) -> None:
             random_trigger = True
             last_random_reply = now_ts
 
-    if not is_dm and discord_bot.user not in new_msg.mentions and not random_trigger:
+    if not directed and not random_trigger:
+        # Sometimes just react with an emoji instead of saying anything
+        reactions_cfg = config.get("reactions") or {}
+        guild_id = new_msg.guild.id
+        if (
+            reactions_cfg.get("enabled")
+            and not learning.is_opted_out(guild_id, new_msg.author.id)
+            and time.time() - last_reaction_time.get(guild_id, 0) >= reactions_cfg.get("cooldown_seconds", 300)
+            and random.random() < reactions_cfg.get("chance", 0.05)
+        ):
+            last_reaction_time[guild_id] = time.time()
+            run_in_background(react_in_background(new_msg, config))
         return
 
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
@@ -460,20 +553,9 @@ async def on_message(new_msg: discord.Message) -> None:
     if is_bad_user or is_bad_channel:
         return
 
-    provider_slash_model = curr_model
-    provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
-
-    provider_config = config["providers"][provider]
-
-    base_url = provider_config["base_url"]
-    api_key = provider_config.get("api_key", "sk-no-key-required")
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-
-    model_parameters = config["models"].get(provider_slash_model, None)
-
-    extra_headers = provider_config.get("extra_headers")
-    extra_query = provider_config.get("extra_query")
-    extra_body = (provider_config.get("extra_body") or {}) | (model_parameters or {}) or None
+    # With auto_switch on, read the conversation as the vision model, then use the fast text model if there are no images
+    switch_models = auto_switch_models(config)
+    provider_slash_model = switch_models[1] if switch_models else curr_model
 
     accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
 
@@ -596,10 +678,20 @@ async def on_message(new_msg: discord.Message) -> None:
 
         messages = messages[:max_messages]
 
-    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}, random chime-in: {random_trigger}):\n{new_msg.content}")
+    if switch_models and not any(isinstance(m["content"], list) for m in messages):
+        provider_slash_model = switch_models[0]
 
-    # What the bot has learned from this server, plus media it may send back
-    learned_text, offered_media = "", {}
+    llm = resolve_model(config, provider_slash_model)
+    openai_client, model = llm.client, llm.model
+    extra_headers, extra_query, extra_body = llm.extra_headers, llm.extra_query, llm.extra_body
+
+    logging.info(
+        f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}, "
+        f"random chime-in: {random_trigger}, reply to bot: {replied_to_bot}, model: {provider_slash_model}):\n{new_msg.content}"
+    )
+
+    # What the bot has learned from this server, plus media and reactions it may use
+    learned = learning.LearnedContext()
     if not is_dm and new_msg.guild:
         chain_texts = [m["content"] if isinstance(m["content"], str) else m["content"][0].get("text", "") for m in messages]
         query = " ".join(chain_texts[:4])
@@ -609,10 +701,34 @@ async def on_message(new_msg: discord.Message) -> None:
         participant_ids += [int(user_id) for text in chain_texts for user_id in learning.MENTION_ID_RE.findall(text)]
         participant_ids = [user_id for user_id in dict.fromkeys(participant_ids) if user_id != discord_bot.user.id]
 
+        # Real Barotrauma questions get the matching official wiki page
+        extra_sections = []
+        if (config.get("wiki") or {}).get("enabled"):
+            question = new_msg.clean_content.replace(f"@{discord_bot.user.display_name}", "").strip()
+            try:
+                if found := await asyncio.wait_for(barowiki.lookup(httpx_client, question), timeout=12):
+                    extra_sections.append((95, barowiki.prompt_section(*found)))
+                    logging.info(f"Using Barotrauma wiki page: {found[0]}")
+            except Exception:
+                logging.exception("Barotrauma wiki lookup failed")
+
         try:
-            learned_text, offered_media = await learning.build_context(new_msg.guild.id, query, config, participant_ids)
+            learned = await learning.build_context(
+                new_msg.guild.id,
+                query,
+                config,
+                participant_ids,
+                channel_id=new_msg.channel.id,
+                message_id=new_msg.id,
+                now=datetime.now().astimezone(),
+                usable_emoji_ids=usable_emoji_ids(new_msg.guild),
+                embed=embed_texts if (config.get("recall") or {}).get("embedding_model") else None,
+                extra_sections=extra_sections,
+            )
         except Exception:
             logging.exception("Error while building learned context")
+
+    learned_text, offered_media = learned.text, learned.media
 
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
@@ -713,6 +829,13 @@ async def on_message(new_msg: discord.Message) -> None:
                 logging.info(f"Sent remembered {chosen['kind']} (media ID: {chosen['id']})")
         except Exception:
             logging.exception("Error while sending remembered media")
+
+    # React to their message if the model picked one of the offered emoji
+    if reaction := learning.chosen_reaction(full_response, learned.reactions):
+        try:
+            await new_msg.add_reaction(discord.PartialEmoji.from_str(reaction))
+        except Exception:
+            logging.exception("Error while adding reaction")
 
     # Remember what the bot said, so reactions and replies to it can teach it what lands
     if not is_dm and new_msg.guild:
