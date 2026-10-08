@@ -6,8 +6,10 @@ import io
 import logging
 import os
 import random
+import re
 import time
 from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 
 import discord
 from discord.app_commands import Choice
@@ -38,6 +40,14 @@ MAX_MESSAGE_NODES = 500
 
 GIF_MAX_FRAMES = 4  # how many frames to pull from an animated GIF
 GIF_MAX_SIZE = 768  # longest side in pixels for each extracted frame
+
+# Image links pasted in chat (not uploaded) are only fetched from these hosts
+IMAGE_LINK_HOSTS = {"cdn.discordapp.com", "media.discordapp.net", "media.tenor.com", "i.imgur.com"}
+IMAGE_LINK_HOST_SUFFIXES = (".discordapp.net", ".giphy.com")
+IMAGE_LINK_EXTENSIONS = (".gif", ".png", ".jpg", ".jpeg", ".webp")
+MAX_LINK_IMAGES = 3
+MAX_LINK_IMAGE_BYTES = 10 * 1024 * 1024
+URL_PATTERN = re.compile(r"https?://[^\s<>]+")
 
 
 def resolve_env(node: Any) -> Any:
@@ -70,6 +80,43 @@ def gif_to_png_frames(data: bytes, max_frames: int = GIF_MAX_FRAMES) -> list[byt
             frames.append(buffer.getvalue())
 
     return frames
+
+
+def is_allowed_image_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in ("http", "https") and (host in IMAGE_LINK_HOSTS or host.endswith(IMAGE_LINK_HOST_SUFFIXES))
+
+
+def extract_image_urls(msg: Any) -> list[str]:
+    """Find image/GIF links in a message's text, falling back to its embeds."""
+    urls = []
+
+    for url in URL_PATTERN.findall(msg.content or ""):
+        url = url.rstrip(").,>")
+        if is_allowed_image_url(url) and urlparse(url).path.lower().endswith(IMAGE_LINK_EXTENSIONS):
+            urls.append(url)
+
+    if not urls:
+        for embed in msg.embeds:
+            for media in (embed.image, embed.thumbnail):
+                media_url = getattr(media, "url", None)
+                if media_url and is_allowed_image_url(media_url):
+                    urls.append(media_url)
+
+    return list(dict.fromkeys(urls))[:MAX_LINK_IMAGES]
+
+
+async def make_image_parts(content_type: str, data: bytes) -> list[dict[str, Any]]:
+    """Turn image bytes into model-ready parts. GIFs become a few PNG frames."""
+    if content_type == "image/gif":
+        try:
+            gif_frames = await asyncio.to_thread(gif_to_png_frames, data)
+            return [dict(type="image_url", image_url=dict(url=f"data:image/png;base64,{b64encode(frame).decode('utf-8')}")) for frame in gif_frames]
+        except Exception:
+            logging.exception("Couldn't convert GIF to frames, sending it as-is")
+
+    return [dict(type="image_url", image_url=dict(url=f"data:{content_type};base64,{b64encode(data).decode('utf-8')}"))]
 
 
 config = get_config()
@@ -248,23 +295,22 @@ async def on_message(new_msg: discord.Message) -> None:
 
                 curr_node.images = []
 
+                # Uploaded images (GIFs are turned into a few still frames since Ollama can't read them)
                 for att, resp in zip(good_attachments, attachment_responses):
-                    if not att.content_type.startswith("image"):
+                    if att.content_type.startswith("image"):
+                        curr_node.images += await make_image_parts(att.content_type, resp.content)
+
+                # Image/GIF links pasted in the message
+                for link_url in extract_image_urls(curr_msg):
+                    try:
+                        link_resp = await httpx_client.get(link_url, timeout=15)
+                    except Exception:
+                        logging.exception(f"Couldn't fetch image link: {link_url}")
                         continue
 
-                    # Ollama can't read GIFs, so send a few still frames instead
-                    if att.content_type == "image/gif":
-                        try:
-                            gif_frames = await asyncio.to_thread(gif_to_png_frames, resp.content)
-                            curr_node.images += [
-                                dict(type="image_url", image_url=dict(url=f"data:image/png;base64,{b64encode(frame).decode('utf-8')}"))
-                                for frame in gif_frames
-                            ]
-                            continue
-                        except Exception:
-                            logging.exception("Couldn't convert GIF to frames, sending it as-is")
-
-                    curr_node.images.append(dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}")))
+                    link_type = link_resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                    if link_resp.status_code == 200 and link_type.startswith("image/") and len(link_resp.content) <= MAX_LINK_IMAGE_BYTES:
+                        curr_node.images += await make_image_parts(link_type, link_resp.content)
 
                 if curr_node.role == "user" and (curr_node.text or curr_node.images):
                     curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
