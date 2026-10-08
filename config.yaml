@@ -35,11 +35,37 @@ random_replies:
 
 learning:                 # the bot picks up the server's slang, jokes and vibe from chat
   enabled: true
-  style_samples: 12       # random real messages shown to the bot each reply, so it talks like you all
+  speech_habits: true     # measure how people type (lowercase, length, emoji, phrases) and match it
+  style_samples: 8        # random real messages shown to the bot each reply
   lore_every_messages: 200  # rebuild its notes about the server after this many new messages
   lore_source_messages: 120 # how many recent messages those notes are built from
+  max_context_chars: 7000 # cap on learned stuff added to each prompt (lowest priority gets dropped)
+  background_model:       # optional, e.g. ollama/llama3.1:8b for the background learning jobs
   ignored_user_ids: []    # people whose messages should never be learned from
   channel_ids: []         # empty = learn from every channel the bot can see
+
+persona:                  # an evolving personality that drifts toward how the server talks
+  enabled: true
+  evolve_every_messages: 300  # rewrite the personality after this many new messages
+  seed: |                 # starting personality (used until the first rewrite)
+    You are dry, a little sarcastic, and loyal underneath it. You roast people
+    for dumb mistakes but never mean-spirited. You talk like a normal person in
+    a group chat: casual, short, no speeches.
+  guardrails:             # rules that never change, no matter how the personality evolves
+    - Never claim to be human if someone sincerely asks whether you're a bot.
+    - No slurs or hateful jokes about anyone's race, religion, sexuality or identity, even if people here joke like that.
+    - If someone seems genuinely upset, drop the roasting and be decent to them.
+    - Don't bring up anything private or sensitive about someone in front of others.
+
+people:                   # notes on each person, plus facts added with /remember
+  enabled: true
+  notes_every_messages: 50  # update someone's notes after they send this many new messages
+  max_in_context: 4       # how many people's notes the bot sees per reply
+  roster_size: 15         # how many regulars it knows by name and ID
+
+feedback:                 # learns which of its messages land from reactions and replies
+  enabled: true
+  show_hits: 4            # how many of its best-received lines it sees as examples
 
 media:                    # the bot remembers gifs/images/videos people post and can send them back
   enabled: true

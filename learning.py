@@ -1,21 +1,26 @@
 """Server learning for llmcord.
 
-Remembers what people in a server say and the media they share, so the bot can
-pick up the server's slang, running jokes and vibe, and send reaction gifs,
-images and videos that were posted before.
+Lets the bot be shaped by the server it lives in:
+- remembers what people say and builds notes about the server (slang, running jokes)
+- measures how people actually type (lowercase, message length, emoji, common phrases)
+- keeps an evolving personality that drifts toward the crew, with fixed guardrails
+- learns which of its own messages land (reactions, replies) and which flop
+- keeps notes on each person, plus facts people tell it with /remember
+- remembers gifs, images and videos people post so it can send them back
 
 Everything is stored locally in data/memory.db (plus data/media/ for saved
 files). Nothing leaves the computer the bot runs on.
 """
 
 import asyncio
+from collections import Counter
+from dataclasses import dataclass
 import logging
 import os
 import random
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
@@ -30,11 +35,18 @@ MEDIA_DIR = os.path.join(DATA_DIR, "media")
 URL_RE = re.compile(r"https?://[^\s<>]+")
 MEDIA_TAG_RE = re.compile(r"\[\s*media\s*[:#]?\s*(\d+)\s*\]", re.IGNORECASE)
 WORD_RE = re.compile(r"[a-z0-9']+")
+TOKEN_RE = re.compile(r"[a-z][a-z0-9']*")
+EMOJI_RE = re.compile(r"<a?:\w+:\d+>|[\U0001F300-\U0001FAFF☀-➿]")
+MENTION_ID_RE = re.compile(r"<@!?(\d+)>")
 
 MAX_STORED_TEXT = 1000
-LORE_CHAR_BUDGET = 8000  # keeps the notes prompt inside a small local model's context
-LORE_RETRY_SECONDS = 600
+PROMPT_CHAR_BUDGET = 8000  # keeps background prompts inside a small local model's context
+RETRY_SECONDS = 600
+HABITS_CACHE_SECONDS = 600
 MAX_MEDIA_PER_MESSAGE = 5
+FEEDBACK_DAYS = 30
+
+Complete = Callable[[list[dict[str, str]]], Awaitable[str]]
 
 DISCORD_CDN_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
 
@@ -55,12 +67,26 @@ GENERIC_NAME_WORDS = {
 }
 
 STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be", "to", "of", "in", "on", "at", "for", "it",
-    "its", "it's", "i", "im", "i'm", "you", "your", "u", "me", "my", "we", "he", "she", "they", "them", "this", "that",
-    "with", "so", "just", "like", "do", "dont", "don't", "not", "no", "yes", "yeah", "lol", "lmao", "what", "when",
-    "who", "how", "why", "can", "have", "has", "had", "if", "then", "there", "here", "about", "up", "out", "get",
-    "got", "all", "some", "one", "said", "after", "captioned", "someone", "gif", "image", "video",
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be", "been", "to", "of", "in", "on", "at", "for",
+    "it", "its", "it's", "i", "im", "i'm", "you", "your", "you're", "u", "me", "my", "we", "he", "she", "they", "them",
+    "this", "that", "with", "so", "just", "like", "do", "does", "did", "dont", "don't", "not", "no", "yes", "what",
+    "when", "who", "how", "why", "can", "can't", "have", "has", "had", "if", "then", "there", "here", "about", "up",
+    "out", "get", "got", "all", "some", "one", "said", "after", "captioned", "someone", "gif", "image", "video", "will",
+    "would", "should", "could", "from", "into", "too", "very", "really", "also", "his", "her", "him", "our", "us", "am",
+    "go", "going", "know", "think", "now", "then", "than", "that's", "there's", "what's", "a", "oh", "ok", "okay",
+    "posted", "said", "want", "need", "make", "see", "yeah", "lol",
 }
+
+# Short words that are slang, not noise, so they count as phrases worth copying
+SLANG_KEEP = {"lol", "lmao", "lmfao", "fr", "ngl", "tbh", "idk", "bro", "bruh", "ong", "istg", "wtf", "nah", "yeah", "yea", "ight", "aight", "deadass", "lowkey", "highkey"}
+
+# Two-word phrases starting with these are just "the reactor" style noise
+PHRASE_BAD_STARTS = {"the", "a", "an", "this", "that", "my", "your", "our", "their", "his", "her", "its", "of", "to", "in", "on", "at", "for"}
+
+LAUGH_EMOJI = {"💀", "😭", "😂", "🤣", "☠", "😹", "💯", "🔥"}
+NEGATIVE_EMOJI = {"👎", "🙄", "😐", "😑", "🤢", "🚮"}
+LAUGH_RE = re.compile(r"\b(lmao+|lmfao|lol+|haha+|dead|dying|crying|hilarious|i'?m weak)\b|💀|😭|😂|🤣", re.IGNORECASE)
+NEGATIVE_RE = re.compile(r"\b(shut up|stfu|cringe|unfunny|not funny|nobody asked|be quiet|annoying)\b|👎|🙄", re.IGNORECASE)
 
 
 @dataclass
@@ -68,11 +94,16 @@ class LearnResult:
     stored_text: bool = False
     media_saved: int = 0
     lore_due: bool = False
+    persona_due: bool = False
+    person_due: bool = False
 
 
 _media_bytes: Optional[int] = None
-_lore_running: set[int] = set()
-_lore_last_attempt: dict[int, float] = {}
+_running: set[tuple] = set()
+_last_attempt: dict[tuple, float] = {}
+_optouts: set[tuple[int, int]] = set()
+_habits_cache: dict[int, tuple[float, str]] = {}
+_llm_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------- database
@@ -117,10 +148,12 @@ def init_db() -> None:
                 author_id INTEGER,
                 author_name TEXT,
                 content TEXT,
-                created_at REAL
+                created_at REAL,
+                to_bot INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_messages_guild ON messages (guild_id, id);
             CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages (channel_id, id);
+            CREATE INDEX IF NOT EXISTS idx_messages_author ON messages (guild_id, author_id, id);
 
             CREATE TABLE IF NOT EXISTS media (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,19 +172,64 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_media_guild ON media (guild_id, id);
 
-            CREATE TABLE IF NOT EXISTS lore (
-                guild_id INTEGER PRIMARY KEY,
-                notes TEXT,
-                updated_at REAL
+            CREATE TABLE IF NOT EXISTS lore (guild_id INTEGER PRIMARY KEY, notes TEXT, updated_at REAL);
+
+            CREATE TABLE IF NOT EXISTS persona (guild_id INTEGER PRIMARY KEY, traits TEXT, updated_at REAL);
+
+            CREATE TABLE IF NOT EXISTS bot_messages (
+                id INTEGER PRIMARY KEY,
+                guild_id INTEGER,
+                channel_id INTEGER,
+                content TEXT,
+                created_at REAL
             );
+            CREATE INDEX IF NOT EXISTS idx_bot_messages_guild ON bot_messages (guild_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS feedback (
+                message_id INTEGER,
+                user_id INTEGER,
+                kind TEXT,
+                key TEXT,
+                weight REAL,
+                created_at REAL,
+                PRIMARY KEY (message_id, user_id, kind, key)
+            );
+
+            CREATE TABLE IF NOT EXISTS people (
+                guild_id INTEGER,
+                user_id INTEGER,
+                name TEXT,
+                notes TEXT,
+                updated_at REAL,
+                PRIMARY KEY (guild_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                user_id INTEGER,
+                fact TEXT,
+                added_by INTEGER,
+                created_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS optouts (guild_id INTEGER, user_id INTEGER, PRIMARY KEY (guild_id, user_id));
             """
         )
+
+        # Databases made by the first version of this file don't have to_bot yet
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+        if "to_bot" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN to_bot INTEGER DEFAULT 0")
+
         conn.commit()
+        _optouts.clear()
+        _optouts.update((row[0], row[1]) for row in conn.execute("SELECT guild_id, user_id FROM optouts"))
     finally:
         conn.close()
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- small helpers
 
 
 def words(text: str) -> set[str]:
@@ -181,10 +259,8 @@ def describe_filename(path: str) -> str:
 
 def _slug_words(slug: str, drop_last: bool = False) -> str:
     parts = [p for p in slug.strip("/").split("-") if p]
-    if drop_last and len(parts) > 1:
+    if drop_last:
         parts = parts[:-1]
-    elif drop_last:
-        parts = []
     return " ".join(p for p in parts if not p.isdigit() and p.lower() not in GENERIC_NAME_WORDS)
 
 
@@ -240,8 +316,40 @@ def clean_message_text(msg: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()[:MAX_STORED_TEXT]
 
 
+def _normalize_emoji(emoji: str) -> str:
+    return emoji.replace("️", "")
+
+
+def reaction_weight(emoji: str, name: str = "") -> int:
+    emoji = _normalize_emoji(emoji)
+    if emoji in LAUGH_EMOJI or re.search(r"lol|lmao|laugh|kek|dead|skull|cry", name or "", re.IGNORECASE):
+        return 2
+    if emoji in NEGATIVE_EMOJI:
+        return -2
+    return 1
+
+
+def reply_weight(text: str) -> int:
+    if NEGATIVE_RE.search(text or ""):
+        return -2
+    if LAUGH_RE.search(text or ""):
+        return 2
+    return 1
+
+
+def _budgeted_lines(lines: list[str], budget: int) -> list[str]:
+    """Keep lines (newest first in input) until the character budget runs out."""
+    kept, used = [], 0
+    for line in lines:
+        if used + len(line) > budget:
+            break
+        kept.append(line)
+        used += len(line)
+    return kept
+
+
 def can_learn_from(msg: Any, config: dict[str, Any]) -> bool:
-    if not msg.guild or msg.author.bot:
+    if not msg.guild or msg.author.bot or (msg.guild.id, msg.author.id) in _optouts:
         return False
 
     learn_cfg = config.get("learning") or {}
@@ -287,6 +395,14 @@ def _write_file(path: str, data: bytes) -> None:
         file.write(data)
 
 
+def _remove_file(relative_path: Optional[str]) -> None:
+    if relative_path:
+        try:
+            os.remove(os.path.join(DATA_DIR, relative_path))
+        except OSError:
+            pass
+
+
 async def _download(http_client: httpx.AsyncClient, url: str, dest: str, max_bytes: int, max_total_bytes: int) -> Optional[str]:
     """Download url to dest (relative to DATA_DIR). Returns the relative path or None."""
     global _media_bytes
@@ -315,11 +431,43 @@ async def _download(http_client: httpx.AsyncClient, url: str, dest: str, max_byt
     return dest
 
 
-# ---------------------------------------------------------------- learning
+# ---------------------------------------------------------------- background jobs
 
 
-async def learn_from_message(msg: Any, config: dict[str, Any], http_client: httpx.AsyncClient) -> LearnResult:
-    """Store a server message and any media in it. Safe to call on every message."""
+def _job_blocked(key: tuple) -> bool:
+    return key in _running or time.time() - _last_attempt.get(key, 0) < RETRY_SECONDS
+
+
+async def _run_job(key: tuple, force: bool, job: Callable[[], Awaitable[bool]]) -> bool:
+    """Run one background model job at a time, with a retry cooldown so failures don't loop."""
+    if key in _running or (not force and _job_blocked(key)):
+        return False
+
+    _running.add(key)
+    _last_attempt[key] = time.time()
+    try:
+        async with _llm_lock:
+            return await job()
+    except Exception:
+        logging.exception(f"Background learning job failed: {key[0]}")
+        return False
+    finally:
+        _running.discard(key)
+
+
+async def _count_since(guild_id: int, since: float, author_id: Optional[int] = None) -> int:
+    if author_id is None:
+        row = await _adb("SELECT COUNT(*) AS n FROM messages WHERE guild_id = ? AND created_at > ?", (guild_id, since), "one")
+    else:
+        row = await _adb("SELECT COUNT(*) AS n FROM messages WHERE guild_id = ? AND author_id = ? AND created_at > ?", (guild_id, author_id, since), "one")
+    return row["n"]
+
+
+# ---------------------------------------------------------------- learning from messages
+
+
+async def learn_from_message(msg: Any, config: dict[str, Any], http_client: httpx.AsyncClient, bot_user_id: Optional[int] = None) -> LearnResult:
+    """Store a server message, any media in it, and feedback on the bot's messages. Safe on every message."""
     result = LearnResult()
     learn_cfg = config.get("learning") or {}
     media_cfg = config.get("media") or {}
@@ -328,12 +476,24 @@ async def learn_from_message(msg: Any, config: dict[str, Any], http_client: http
         return result
 
     text = clean_message_text(msg)
-    guild_id, channel_id = msg.guild.id, msg.channel.id
+    guild_id = msg.guild.id
+
+    # Is this aimed at the bot? (mentions it, or replies to one of its messages)
+    replied_to_bot = None
+    if (reference := getattr(msg, "reference", None)) and (ref_id := getattr(reference, "message_id", None)):
+        replied_to_bot = await _adb("SELECT id FROM bot_messages WHERE id = ?", (ref_id,), "one")
+    to_bot = bool(replied_to_bot) or any(getattr(user, "id", None) == bot_user_id for user in getattr(msg, "mentions", []))
+
+    if replied_to_bot:
+        await _adb(
+            "INSERT OR REPLACE INTO feedback (message_id, user_id, kind, key, weight, created_at) VALUES (?, ?, 'reply', ?, ?, ?)",
+            (replied_to_bot["id"], msg.author.id, str(msg.id), reply_weight(text), time.time()),
+        )
 
     if learn_cfg.get("enabled") and text:
         await _adb(
-            "INSERT OR REPLACE INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (msg.id, guild_id, channel_id, msg.author.id, msg.author.display_name, text, msg.created_at.timestamp()),
+            "INSERT OR REPLACE INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at, to_bot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (msg.id, guild_id, msg.channel.id, msg.author.id, msg.author.display_name, text, msg.created_at.timestamp(), int(to_bot)),
         )
         result.stored_text = True
 
@@ -342,6 +502,8 @@ async def learn_from_message(msg: Any, config: dict[str, Any], http_client: http
 
     if learn_cfg.get("enabled") and result.stored_text:
         result.lore_due = await _lore_due(guild_id, learn_cfg)
+        result.persona_due = await _persona_due(guild_id, config)
+        result.person_due = await _person_due(guild_id, msg.author.id, config)
 
     return result
 
@@ -428,16 +590,144 @@ async def forget_messages(message_ids: list[int]) -> None:
     for message_id in message_ids:
         rows = await _adb("SELECT file_path FROM media WHERE message_id = ?", (message_id,), "all") or []
         for row in rows:
-            if row["file_path"]:
-                try:
-                    os.remove(os.path.join(DATA_DIR, row["file_path"]))
-                except OSError:
-                    pass
+            _remove_file(row["file_path"])
         await _adb("DELETE FROM media WHERE message_id = ?", (message_id,))
         await _adb("DELETE FROM messages WHERE id = ?", (message_id,))
+        await _adb("DELETE FROM bot_messages WHERE id = ?", (message_id,))
+        await _adb("DELETE FROM feedback WHERE message_id = ? OR (kind = 'reply' AND key = ?)", (message_id, str(message_id)))
 
 
-# ---------------------------------------------------------------- lore notes
+# ---------------------------------------------------------------- feedback on the bot's own messages
+
+
+async def record_bot_messages(guild_id: int, channel_id: int, message_ids: list[int], text: str) -> None:
+    for message_id in message_ids:
+        await _adb(
+            "INSERT OR REPLACE INTO bot_messages (id, guild_id, channel_id, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (message_id, guild_id, channel_id, text[:1000], time.time()),
+        )
+
+
+async def record_reaction(message_id: int, user_id: int, emoji: str, emoji_name: str, added: bool) -> None:
+    if not await _adb("SELECT id FROM bot_messages WHERE id = ?", (message_id,), "one"):
+        return
+
+    key = _normalize_emoji(emoji)
+    if added:
+        await _adb(
+            "INSERT OR REPLACE INTO feedback (message_id, user_id, kind, key, weight, created_at) VALUES (?, ?, 'reaction', ?, ?, ?)",
+            (message_id, user_id, key, reaction_weight(emoji, emoji_name), time.time()),
+        )
+    else:
+        await _adb("DELETE FROM feedback WHERE message_id = ? AND user_id = ? AND kind = 'reaction' AND key = ?", (message_id, user_id, key))
+
+
+async def get_hits(guild_id: int, limit: int) -> list[str]:
+    """The bot's best-received lines lately."""
+    rows = await _adb(
+        "SELECT b.content, SUM(f.weight) AS score FROM bot_messages b JOIN feedback f ON f.message_id = b.id "
+        "WHERE b.guild_id = ? AND b.created_at > ? GROUP BY b.id HAVING score >= 2 ORDER BY score DESC LIMIT ?",
+        (guild_id, time.time() - FEEDBACK_DAYS * 86400, limit * 3),
+        "all",
+    )
+    return list(dict.fromkeys(row["content"] for row in rows if row["content"]))[:limit]
+
+
+async def get_flops(guild_id: int, limit: int) -> list[str]:
+    """Lines that got negative reactions, or got ignored while people were actively chatting."""
+    rows = await _adb(
+        "SELECT b.id, b.channel_id, b.content, b.created_at, COALESCE(SUM(f.weight), 0) AS score "
+        "FROM bot_messages b LEFT JOIN feedback f ON f.message_id = b.id "
+        "WHERE b.guild_id = ? AND b.created_at > ? AND b.created_at < ? GROUP BY b.id ORDER BY b.created_at DESC LIMIT 100",
+        (guild_id, time.time() - FEEDBACK_DAYS * 86400, time.time() - 600),
+        "all",
+    )
+
+    flops = []
+    for row in rows:
+        if row["score"] < 0:
+            flops.append(row["content"])
+        elif row["score"] == 0:
+            chatter = await _adb(
+                "SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND created_at > ? AND created_at < ?",
+                (row["channel_id"], row["created_at"], row["created_at"] + 600),
+                "one",
+            )
+            if chatter["n"] >= 5:
+                flops.append(row["content"])
+
+    return list(dict.fromkeys(content for content in flops if content))[:limit]
+
+
+# ---------------------------------------------------------------- speech habits
+
+
+async def get_speech_habits(guild_id: int) -> str:
+    """Measure how people here actually type, as concrete rules. Cached for a few minutes."""
+    if (cached := _habits_cache.get(guild_id)) and time.time() - cached[0] < HABITS_CACHE_SECONDS:
+        return cached[1]
+
+    rows = await _adb("SELECT author_id, content FROM messages WHERE guild_id = ? ORDER BY id DESC LIMIT 600", (guild_id,), "all")
+    text = compute_speech_habits([(row["author_id"], row["content"]) for row in rows])
+    _habits_cache[guild_id] = (time.time(), text)
+    return text
+
+
+def compute_speech_habits(rows: list[tuple[int, str]]) -> str:
+    texts = [(author, content) for author, content in rows if content and content.strip()]
+    if len(texts) < 30:
+        return ""
+
+    lines = []
+    lettered = [content for _, content in texts if re.search(r"[A-Za-z]", content)]
+    if lettered:
+        lowercase = sum(1 for content in lettered if content == content.lower()) / len(lettered)
+        if lowercase >= 0.7:
+            lines.append(f"Almost everyone types in all lowercase ({lowercase:.0%} of messages). You do too.")
+        elif lowercase <= 0.3:
+            lines.append("People here mostly capitalize normally.")
+
+    periods = sum(1 for _, content in texts if content.rstrip().endswith(".") and not content.rstrip().endswith("..")) / len(texts)
+    if periods <= 0.15:
+        lines.append("Hardly anyone ends a message with a period. Don't.")
+    elif periods >= 0.5:
+        lines.append("People here use proper punctuation.")
+
+    lengths = sorted(len(content.split()) for _, content in texts)
+    median = lengths[len(lengths) // 2]
+    lines.append(f"A typical message here is about {median} words. Match that; only go longer when actually explaining something.")
+
+    emoji_counts = Counter(_normalize_emoji(e) for _, content in texts for e in EMOJI_RE.findall(content))
+    emoji_rate = sum(1 for _, content in texts if EMOJI_RE.search(content)) / len(texts)
+    if emoji_rate >= 0.2 and emoji_counts:
+        favorites = " ".join(e for e, _ in emoji_counts.most_common(5))
+        lines.append(f"Emoji are common here. Favorites: {favorites}")
+    elif emoji_rate <= 0.05:
+        lines.append("Emoji are rare here. Mostly skip them.")
+
+    # Words and two-word phrases used by several different people
+    users_by_phrase: dict[str, set[int]] = {}
+    phrase_counts: Counter = Counter()
+    for author, content in texts:
+        tokens = TOKEN_RE.findall(content.lower())
+        grams = [t for t in tokens if t in SLANG_KEEP or (t not in STOPWORDS and len(t) > 2)]
+        grams += [
+            f"{a} {b}"
+            for a, b in zip(tokens, tokens[1:])
+            if a not in PHRASE_BAD_STARTS and not (a in STOPWORDS and b in STOPWORDS) and len(a + b) > 4
+        ]
+        for gram in set(grams):
+            phrase_counts[gram] += 1
+            users_by_phrase.setdefault(gram, set()).add(author)
+
+    common = [p for p, n in phrase_counts.most_common(200) if n >= 4 and len(users_by_phrase[p]) >= 2]
+    if common:
+        lines.append("Words and phrases people here use a lot: " + ", ".join(common[:15]))
+
+    return "\n".join(f"- {line}" for line in lines)
+
+
+# ---------------------------------------------------------------- server notes (lore)
 
 
 async def get_lore(guild_id: int) -> str:
@@ -446,24 +736,16 @@ async def get_lore(guild_id: int) -> str:
 
 
 async def _lore_due(guild_id: int, learn_cfg: dict[str, Any]) -> bool:
-    if guild_id in _lore_running or time.time() - _lore_last_attempt.get(guild_id, 0) < LORE_RETRY_SECONDS:
+    if _job_blocked(("lore", guild_id)):
         return False
-
     row = await _adb("SELECT updated_at FROM lore WHERE guild_id = ?", (guild_id,), "one")
-    since = row["updated_at"] if row else 0
-    count = await _adb("SELECT COUNT(*) AS n FROM messages WHERE guild_id = ? AND created_at > ?", (guild_id, since), "one")
-    return count["n"] >= learn_cfg.get("lore_every_messages", 200)
+    return await _count_since(guild_id, row["updated_at"] if row else 0) >= learn_cfg.get("lore_every_messages", 200)
 
 
-async def rebuild_lore(guild_id: int, config: dict[str, Any], complete: Callable[[list[dict[str, str]]], Awaitable[str]]) -> bool:
+async def rebuild_lore(guild_id: int, config: dict[str, Any], complete: Complete, force: bool = False, fresh: bool = False) -> bool:
     """Ask the model to update its notes about the server from recent messages."""
-    if guild_id in _lore_running:
-        return False
 
-    _lore_running.add(guild_id)
-    _lore_last_attempt[guild_id] = time.time()
-
-    try:
+    async def job() -> bool:
         learn_cfg = config.get("learning") or {}
         rows = await _adb(
             "SELECT author_name, content FROM messages WHERE guild_id = ? ORDER BY id DESC LIMIT ?",
@@ -473,16 +755,8 @@ async def rebuild_lore(guild_id: int, config: dict[str, Any], complete: Callable
         if len(rows) < 15:
             return False
 
-        lines, used = [], 0
-        for row in rows:
-            line = f"{row['author_name']}: {row['content'][:200]}"
-            if used + len(line) > LORE_CHAR_BUDGET:
-                break
-            lines.append(line)
-            used += len(line)
-        lines.reverse()
-
-        old_notes = await get_lore(guild_id) or "(none yet)"
+        lines = _budgeted_lines([f"{row['author_name']}: {row['content'][:200]}" for row in rows], PROMPT_CHAR_BUDGET)[::-1]
+        old_notes = "(none yet)" if fresh else (await get_lore(guild_id) or "(none yet)")
         prompt = [
             dict(role="system", content="You keep short, accurate notes about a Discord community for a chatbot that hangs out there."),
             dict(
@@ -492,8 +766,9 @@ async def rebuild_lore(guild_id: int, config: dict[str, Any], complete: Callable
                     + "\n".join(lines)
                     + f"\n\nYour current notes:\n{old_notes}\n\n"
                     "Rewrite the notes. Keep what is still true and add what is new. Cover: slang and phrases people use, "
-                    "running jokes and memes, what people talk about a lot, and a few words on how each regular talks. "
-                    "Only include things actually seen in the messages. Plain bullet points, under 200 words, no intro."
+                    "running jokes and memes, and what people talk about a lot. Only include things actually seen in the messages. "
+                    "Skip anything private or sensitive (health, family problems, relationships, where people live). "
+                    "Plain bullet points, under 200 words, no intro."
                 ),
             ),
         ]
@@ -506,12 +781,212 @@ async def rebuild_lore(guild_id: int, config: dict[str, Any], complete: Callable
         logging.info(f"Updated server notes for guild {guild_id}")
         return True
 
-    except Exception:
-        logging.exception("Couldn't rebuild server notes")
-        return False
+    return await _run_job(("lore", guild_id), force, job)
 
-    finally:
-        _lore_running.discard(guild_id)
+
+# ---------------------------------------------------------------- evolving personality
+
+
+async def get_persona(guild_id: int, config: dict[str, Any]) -> str:
+    row = await _adb("SELECT traits FROM persona WHERE guild_id = ?", (guild_id,), "one")
+    return row["traits"] if row else ((config.get("persona") or {}).get("seed") or "").strip()
+
+
+async def reset_persona(guild_id: int) -> None:
+    await _adb("DELETE FROM persona WHERE guild_id = ?", (guild_id,))
+
+
+async def _persona_due(guild_id: int, config: dict[str, Any]) -> bool:
+    persona_cfg = config.get("persona") or {}
+    if not persona_cfg.get("enabled") or _job_blocked(("persona", guild_id)):
+        return False
+    row = await _adb("SELECT updated_at FROM persona WHERE guild_id = ?", (guild_id,), "one")
+    return await _count_since(guild_id, row["updated_at"] if row else 0) >= persona_cfg.get("evolve_every_messages", 300)
+
+
+async def evolve_persona(guild_id: int, config: dict[str, Any], complete: Complete, bot_name: str = "the bot", force: bool = False) -> bool:
+    """Let the bot's personality drift toward how this server talks and treats it."""
+
+    async def job() -> bool:
+        persona_cfg = config.get("persona") or {}
+        current = await get_persona(guild_id, config) or "(no personality written yet)"
+
+        chat = await _adb("SELECT author_name, content FROM messages WHERE guild_id = ? ORDER BY id DESC LIMIT 150", (guild_id,), "all")
+        if len(chat) < 30:
+            return False
+        chat_lines = _budgeted_lines([f"{row['author_name']}: {row['content'][:160]}" for row in chat], 4500)[::-1]
+
+        to_bot = await _adb("SELECT author_name, content FROM messages WHERE guild_id = ? AND to_bot = 1 ORDER BY id DESC LIMIT 30", (guild_id,), "all")
+        to_bot_lines = _budgeted_lines([f"{row['author_name']}: {row['content'][:160]}" for row in to_bot], 1500)[::-1]
+
+        hits = await get_hits(guild_id, 5)
+        flops = await get_flops(guild_id, 5)
+        habits = await get_speech_habits(guild_id)
+
+        sections = [
+            f"Current personality:\n{current}",
+            "How people here type:\n" + (habits or "(not enough data)"),
+            "Recent chat in the server:\n" + "\n".join(chat_lines),
+            "How people have been talking to you:\n" + ("\n".join(to_bot_lines) or "(nothing yet)"),
+            "Your lines that got big laughs or reactions:\n" + ("\n".join(f"- {h}" for h in hits) or "(none yet)"),
+            "Your lines that flopped or got ignored:\n" + ("\n".join(f"- {f}" for f in flops) or "(none yet)"),
+        ]
+        prompt = [
+            dict(role="system", content=f"You write the personality profile for {bot_name}, a chatbot who is a regular member of a Discord friend group."),
+            dict(
+                role="user",
+                content=(
+                    "\n\n".join(sections)
+                    + f"\n\nRewrite {bot_name}'s personality so it fits in with this crew. Change it gradually: keep most of the "
+                    "current personality and adjust maybe 10-20% based on how people talk, what makes them laugh, and how they treat "
+                    f"{bot_name}. Lean into what landed, drop what flopped. Keep the same name and role. Write it in second person "
+                    "(\"You are...\"), concrete and specific (attitude, humor, how you talk, what you care about), under 150 words, "
+                    "no intro, no rules about safety."
+                ),
+            ),
+        ]
+
+        traits = (await complete(prompt) or "").strip()[:1500]
+        if not traits:
+            return False
+
+        await _adb("INSERT OR REPLACE INTO persona (guild_id, traits, updated_at) VALUES (?, ?, ?)", (guild_id, traits, time.time()))
+        logging.info(f"Personality evolved for guild {guild_id}")
+        return True
+
+    return await _run_job(("persona", guild_id), force, job)
+
+
+# ---------------------------------------------------------------- people
+
+
+async def _latest_name(guild_id: int, user_id: int) -> str:
+    row = await _adb("SELECT author_name FROM messages WHERE guild_id = ? AND author_id = ? ORDER BY id DESC LIMIT 1", (guild_id, user_id), "one")
+    if row:
+        return row["author_name"]
+    person = await _adb("SELECT name FROM people WHERE guild_id = ? AND user_id = ?", (guild_id, user_id), "one")
+    return person["name"] if person else str(user_id)
+
+
+async def _person_due(guild_id: int, user_id: int, config: dict[str, Any]) -> bool:
+    people_cfg = config.get("people") or {}
+    if not people_cfg.get("enabled") or _job_blocked(("person", guild_id, user_id)):
+        return False
+    row = await _adb("SELECT updated_at FROM people WHERE guild_id = ? AND user_id = ?", (guild_id, user_id), "one")
+    return await _count_since(guild_id, row["updated_at"] if row else 0, user_id) >= people_cfg.get("notes_every_messages", 50)
+
+
+async def get_facts(guild_id: int, user_id: int, limit: int = 8) -> list[Any]:
+    return await _adb("SELECT * FROM facts WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?", (guild_id, user_id, limit), "all")
+
+
+async def add_fact(guild_id: int, user_id: int, fact: str, added_by: int) -> None:
+    await _adb(
+        "INSERT INTO facts (guild_id, user_id, fact, added_by, created_at) VALUES (?, ?, ?, ?, ?)",
+        (guild_id, user_id, fact.strip()[:200], added_by, time.time()),
+    )
+
+
+async def get_person(guild_id: int, user_id: int) -> tuple[str, list[Any]]:
+    row = await _adb("SELECT notes FROM people WHERE guild_id = ? AND user_id = ?", (guild_id, user_id), "one")
+    return (row["notes"] if row else ""), await get_facts(guild_id, user_id)
+
+
+async def rebuild_person(guild_id: int, user_id: int, config: dict[str, Any], complete: Complete, bot_name: str = "the bot", force: bool = False) -> bool:
+    """Update the bot's notes on one person: what they're into, how they talk, how the bot feels about them."""
+
+    async def job() -> bool:
+        if (guild_id, user_id) in _optouts:
+            return False
+
+        name = await _latest_name(guild_id, user_id)
+        rows = await _adb("SELECT content FROM messages WHERE guild_id = ? AND author_id = ? ORDER BY id DESC LIMIT 100", (guild_id, user_id), "all")
+        facts = await get_facts(guild_id, user_id)
+        if len(rows) < 10 and not facts:
+            return False
+
+        their_lines = _budgeted_lines([row["content"][:200] for row in rows], 3500)[::-1]
+        to_bot = await _adb(
+            "SELECT content FROM messages WHERE guild_id = ? AND author_id = ? AND to_bot = 1 ORDER BY id DESC LIMIT 15", (guild_id, user_id), "all"
+        )
+        reactions = await _adb(
+            "SELECT SUM(CASE WHEN f.weight >= 2 THEN 1 ELSE 0 END) AS laughs, SUM(CASE WHEN f.weight < 0 THEN 1 ELSE 0 END) AS negative "
+            "FROM feedback f JOIN bot_messages b ON b.id = f.message_id WHERE b.guild_id = ? AND f.user_id = ?",
+            (guild_id, user_id),
+            "one",
+        )
+        current, _ = await get_person(guild_id, user_id)
+
+        sections = [
+            f"Person: {name}",
+            "Facts people told you about them:\n" + ("\n".join(f"- {f['fact']}" for f in facts) or "(none)"),
+            "Their recent messages:\n" + "\n".join(their_lines),
+            "Things they said to you:\n" + ("\n".join(f"- {row['content'][:200]}" for row in to_bot) or "(nothing yet)"),
+            f"How they react to you: laughed at your messages {reactions['laughs'] or 0} times, reacted negatively {reactions['negative'] or 0} times.",
+            f"Your current notes on them:\n{current or '(none yet)'}",
+        ]
+        prompt = [
+            dict(role="system", content=f"You are {bot_name}, a regular in a Discord friend group. You keep private notes on each person."),
+            dict(
+                role="user",
+                content=(
+                    "\n\n".join(sections)
+                    + "\n\nRewrite your notes on this person: what they're into, running bits about them, and how they talk. "
+                    "End with one line starting \"Your take:\" on how you feel about them based on how they treat you "
+                    "(shift it gradually, don't flip it overnight). Only include things supported by the messages or facts. "
+                    "Skip anything private or sensitive (health, family problems, relationships, where they live). "
+                    "Under 100 words, no intro."
+                ),
+            ),
+        ]
+
+        notes = (await complete(prompt) or "").strip()[:1200]
+        if not notes:
+            return False
+
+        await _adb(
+            "INSERT OR REPLACE INTO people (guild_id, user_id, name, notes, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, name, notes, time.time()),
+        )
+        logging.info(f"Updated notes on user {user_id} in guild {guild_id}")
+        return True
+
+    return await _run_job(("person", guild_id, user_id), force, job)
+
+
+async def most_active_users(guild_id: int, limit: int, min_messages: int = 15) -> list[int]:
+    rows = await _adb(
+        "SELECT author_id, COUNT(*) AS n FROM messages WHERE guild_id = ? GROUP BY author_id HAVING n >= ? ORDER BY n DESC LIMIT ?",
+        (guild_id, min_messages, limit),
+        "all",
+    )
+    return [row["author_id"] for row in rows]
+
+
+async def forget_person(guild_id: int, user_id: int) -> None:
+    """Wipe everything stored about someone and stop learning from them."""
+    for row in await _adb("SELECT file_path FROM media WHERE guild_id = ? AND author_id = ?", (guild_id, user_id), "all"):
+        _remove_file(row["file_path"])
+
+    await _adb("DELETE FROM media WHERE guild_id = ? AND author_id = ?", (guild_id, user_id))
+    await _adb("DELETE FROM messages WHERE guild_id = ? AND author_id = ?", (guild_id, user_id))
+    await _adb("DELETE FROM people WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    await _adb("DELETE FROM facts WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    await _adb(
+        "DELETE FROM feedback WHERE user_id = ? AND message_id IN (SELECT id FROM bot_messages WHERE guild_id = ?)", (user_id, guild_id)
+    )
+    await _adb("INSERT OR IGNORE INTO optouts (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id))
+    _optouts.add((guild_id, user_id))
+    _habits_cache.pop(guild_id, None)
+
+
+async def opt_back_in(guild_id: int, user_id: int) -> None:
+    await _adb("DELETE FROM optouts WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    _optouts.discard((guild_id, user_id))
+
+
+def is_opted_out(guild_id: int, user_id: int) -> bool:
+    return (guild_id, user_id) in _optouts
 
 
 # ---------------------------------------------------------------- using what was learned
@@ -544,36 +1019,102 @@ async def _pick_media(guild_id: int, query: str, count: int, cooldown_hours: flo
     return relevant + others[: count - len(relevant)]
 
 
-async def build_context(guild_id: int, query: str, config: dict[str, Any]) -> tuple[str, dict[int, Any]]:
+async def _people_section(guild_id: int, participant_ids: list[int], people_cfg: dict[str, Any]) -> str:
+    entries = []
+    for user_id in list(dict.fromkeys(participant_ids))[: people_cfg.get("max_in_context", 4)]:
+        if (guild_id, user_id) in _optouts:
+            continue
+        notes, facts = await get_person(guild_id, user_id)
+        if not notes and not facts:
+            continue
+        entry = f"<@{user_id}> ({await _latest_name(guild_id, user_id)}):"
+        if notes:
+            entry += f"\n{notes}"
+        if facts:
+            entry += "\nThings people told you about them: " + "; ".join(f["fact"] for f in facts[:5])
+        entries.append(entry)
+
+    return ("People in this conversation (your notes on them):\n" + "\n\n".join(entries)) if entries else ""
+
+
+async def _roster_section(guild_id: int, size: int) -> str:
+    rows = await _adb("SELECT author_id, author_name FROM messages WHERE guild_id = ? ORDER BY id DESC LIMIT 1000", (guild_id,), "all")
+    names: dict[int, str] = {}
+    counts: Counter = Counter()
+    for row in rows:
+        names.setdefault(row["author_id"], row["author_name"])
+        counts[row["author_id"]] += 1
+
+    regulars = [user_id for user_id, _ in counts.most_common(size) if (guild_id, user_id) not in _optouts]
+    if not regulars:
+        return ""
+    return "Regulars here (use <@ID> to mention them): " + ", ".join(f"{names[user_id]} = <@{user_id}>" for user_id in regulars)
+
+
+async def build_context(guild_id: int, query: str, config: dict[str, Any], participant_ids: Optional[list[int]] = None) -> tuple[str, dict[int, Any]]:
     """Return extra system-prompt text, plus the media the bot is allowed to send this time."""
-    parts = []
-    offered = {}
     learn_cfg = config.get("learning") or {}
+    persona_cfg = config.get("persona") or {}
+    people_cfg = config.get("people") or {}
+    feedback_cfg = config.get("feedback") or {}
     media_cfg = config.get("media") or {}
 
-    if learn_cfg.get("enabled"):
-        if notes := await get_lore(guild_id):
-            parts.append(f"What you've picked up from hanging around this server (use it naturally, don't recite it):\n{notes}")
+    # (priority, text): when over budget, the lowest priority sections are dropped first
+    sections: list[tuple[int, str]] = []
+    offered: dict[int, Any] = {}
 
-        if (sample_size := learn_cfg.get("style_samples", 12)) > 0:
+    if persona_cfg.get("enabled"):
+        if traits := await get_persona(guild_id, config):
+            sections.append((100, f"Your personality (it keeps growing from hanging out with this crew):\n{traits}"))
+        if guardrails := persona_cfg.get("guardrails"):
+            sections.append((1000, "Always, no matter how your personality changes:\n" + "\n".join(f"- {rule}" for rule in guardrails)))
+
+    if learn_cfg.get("enabled"):
+        if learn_cfg.get("speech_habits", True) and (habits := await get_speech_habits(guild_id)):
+            sections.append((90, f"How people here actually type (measured from real messages):\n{habits}"))
+
+        if notes := await get_lore(guild_id):
+            sections.append((70, f"What you've picked up about this server (use it naturally, don't recite it):\n{notes}"))
+
+        if (sample_size := learn_cfg.get("style_samples", 8)) > 0:
             recent = await _adb("SELECT author_name, content FROM messages WHERE guild_id = ? ORDER BY id DESC LIMIT 400", (guild_id,), "all")
             pool = [row for row in recent if 3 <= len(row["content"]) <= 200]
             if sample := random.sample(pool, min(sample_size, len(pool))):
-                parts.append(
-                    "Some real messages from people here, so you talk like you belong (don't quote them back):\n"
-                    + "\n".join(f"{row['author_name']}: {row['content']}" for row in sample)
+                sections.append(
+                    (30, "Some real messages from people here, so you talk like you belong (don't quote them back):\n"
+                     + "\n".join(f"{row['author_name']}: {row['content']}" for row in sample))
                 )
+
+    if people_cfg.get("enabled"):
+        if people := await _people_section(guild_id, participant_ids or [], people_cfg):
+            sections.append((80, people))
+        if roster := await _roster_section(guild_id, people_cfg.get("roster_size", 15)):
+            sections.append((40, roster))
+
+    if feedback_cfg.get("enabled") and (hits := await get_hits(guild_id, feedback_cfg.get("show_hits", 4))):
+        sections.append((60, "Your lines that got big laughs here. That's the humor that lands; don't repeat them word for word:\n" + "\n".join(f"- {h}" for h in hits)))
 
     if media_cfg.get("enabled") and random.random() < media_cfg.get("offer_chance", 0.4):
         if rows := await _pick_media(guild_id, query, media_cfg.get("candidates", 8), media_cfg.get("reuse_cooldown_hours", 12)):
             offered = {row["id"]: row for row in rows}
-            parts.append(
-                "You can send ONE reaction gif, image or video that people here posted before, but only if it genuinely fits. "
-                "Most replies shouldn't have one. To send it, end your reply with its tag, like [media:12]. Options:\n"
-                + "\n".join(f"[media:{row['id']}] {row['kind']}: {_media_label(row)}" for row in rows)
+            sections.append(
+                (50, "You can send ONE reaction gif, image or video that people here posted before, but only if it genuinely fits. "
+                 "Most replies shouldn't have one. To send it, end your reply with its tag, like [media:12]. Options:\n"
+                 + "\n".join(f"[media:{row['id']}] {row['kind']}: {_media_label(row)}" for row in rows))
             )
 
-    return "\n\n".join(parts), offered
+    # Fit inside the budget, dropping low-priority sections first
+    budget = learn_cfg.get("max_context_chars", 7000)
+    kept, used = [], 0
+    for priority, text in sorted(sections, key=lambda item: item[0], reverse=True):
+        if priority < 1000 and used + len(text) > budget:
+            if text.startswith("You can send ONE"):
+                offered = {}
+            continue
+        kept.append(text)
+        used += len(text)
+
+    return "\n\n".join(kept), offered
 
 
 def strip_media_tags(text: str) -> str:
@@ -604,15 +1145,18 @@ async def send_media(reply_target: Any, row: Any) -> Optional[Any]:
     return sent
 
 
-async def backfill_channel(channel: Any, limit: int, config: dict[str, Any], http_client: httpx.AsyncClient) -> tuple[int, int]:
+async def backfill_channel(channel: Any, limit: int, config: dict[str, Any], http_client: httpx.AsyncClient, bot_user_id: Optional[int] = None) -> tuple[int, int]:
     """Learn from a channel's past messages, oldest first. Returns (messages, media)."""
     history = [msg async for msg in channel.history(limit=limit)]
     history.reverse()
 
     texts = media = 0
     for msg in history:
-        result = await learn_from_message(msg, config, http_client)
+        if msg.author.bot:
+            continue
+        result = await learn_from_message(msg, config, http_client, bot_user_id)
         texts += result.stored_text
         media += result.media_saved
 
+    _habits_cache.pop(getattr(channel.guild, "id", None), None)
     return texts, media

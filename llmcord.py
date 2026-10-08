@@ -147,13 +147,14 @@ def run_in_background(coro) -> None:
 
 
 async def simple_completion(prompt_messages: list[dict[str, str]]) -> str:
-    """One-off, non-streamed request to the current model (used for building server notes)."""
+    """One-off, non-streamed request (used for background learning: notes, personality, people)."""
     cfg = await asyncio.to_thread(get_config)
-    provider, model = curr_model.removesuffix(":vision").split("/", 1)
+    provider_slash_model = (cfg.get("learning") or {}).get("background_model") or curr_model
+    provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
     provider_config = cfg["providers"][provider]
 
     client = AsyncOpenAI(base_url=provider_config["base_url"], api_key=provider_config.get("api_key", "sk-no-key-required"))
-    extra_body = (provider_config.get("extra_body") or {}) | (cfg["models"].get(curr_model) or {}) | {"temperature": 0.4}
+    extra_body = (provider_config.get("extra_body") or {}) | (cfg["models"].get(provider_slash_model) or {}) | {"temperature": 0.4}
 
     response = await client.chat.completions.create(
         model=model,
@@ -166,13 +167,32 @@ async def simple_completion(prompt_messages: list[dict[str, str]]) -> str:
     return response.choices[0].message.content or ""
 
 
+def bot_name() -> str:
+    return discord_bot.user.display_name if discord_bot.user else "the bot"
+
+
 async def learn_in_background(msg: discord.Message, cfg: dict[str, Any]) -> None:
     try:
-        result = await learning.learn_from_message(msg, cfg, httpx_client)
+        result = await learning.learn_from_message(msg, cfg, httpx_client, discord_bot.user.id)
         if result.lore_due:
             await learning.rebuild_lore(msg.guild.id, cfg, simple_completion)
+        if result.persona_due:
+            await learning.evolve_persona(msg.guild.id, cfg, simple_completion, bot_name())
+        if result.person_due:
+            await learning.rebuild_person(msg.guild.id, msg.author.id, cfg, simple_completion, bot_name())
     except Exception:
         logging.exception("Error while learning from message")
+
+
+async def relearn_everything(guild_id: int, cfg: dict[str, Any]) -> None:
+    """Rebuild notes, personality and the regulars' profiles, one after another."""
+    if (cfg.get("learning") or {}).get("enabled"):
+        await learning.rebuild_lore(guild_id, cfg, simple_completion, force=True)
+    if (cfg.get("persona") or {}).get("enabled"):
+        await learning.evolve_persona(guild_id, cfg, simple_completion, bot_name(), force=True)
+    if (cfg.get("people") or {}).get("enabled"):
+        for user_id in await learning.most_active_users(guild_id, 8):
+            await learning.rebuild_person(guild_id, user_id, cfg, simple_completion, bot_name(), force=True)
 
 
 @dataclass
@@ -245,15 +265,98 @@ async def backfill_command(interaction: discord.Interaction, limit: app_commands
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
-        texts, media = await learning.backfill_channel(interaction.channel, limit, cfg, httpx_client)
+        texts, media = await learning.backfill_channel(interaction.channel, limit, cfg, httpx_client, discord_bot.user.id)
     except discord.Forbidden:
         await interaction.followup.send("I can't read this channel's history.", ephemeral=True)
         return
 
-    if (cfg.get("learning") or {}).get("enabled"):
-        run_in_background(learning.rebuild_lore(interaction.guild.id, cfg, simple_completion))
+    run_in_background(relearn_everything(interaction.guild.id, cfg))
 
-    await interaction.followup.send(f"Learned from {texts} messages and saved {media} gifs/images/videos. Updating my notes in the background.", ephemeral=True)
+    await interaction.followup.send(
+        f"Learned from {texts} messages and saved {media} gifs/images/videos. "
+        "Rebuilding my notes, personality and profiles of the regulars in the background (this can take a few minutes).",
+        ephemeral=True,
+    )
+
+
+@discord_bot.tree.command(name="persona", description="See the bot's current personality (admins can reset it)")
+@app_commands.describe(reset="Admin only: throw away the evolved personality and go back to the starting one")
+async def persona_command(interaction: discord.Interaction, reset: bool = False) -> None:
+    cfg = await asyncio.to_thread(get_config)
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return
+
+    if reset:
+        if interaction.user.id not in cfg["permissions"]["users"]["admin_ids"]:
+            await interaction.response.send_message("Only admins can reset the personality.", ephemeral=True)
+            return
+        await learning.reset_persona(interaction.guild.id)
+
+    traits = await learning.get_persona(interaction.guild.id, cfg)
+    prefix = "Reset. Back to:\n" if reset else ""
+    await interaction.response.send_message((prefix + (traits or "No personality written yet."))[:1900], ephemeral=True)
+
+
+@discord_bot.tree.command(name="whois", description="See what the bot remembers about someone")
+async def whois_command(interaction: discord.Interaction, who: discord.Member) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return
+
+    if learning.is_opted_out(interaction.guild.id, who.id):
+        await interaction.response.send_message(f"{who.display_name} asked me to forget them, so I don't keep anything on them.", ephemeral=True)
+        return
+
+    notes, facts = await learning.get_person(interaction.guild.id, who.id)
+    text = notes or "No notes yet. I need to see more of them first."
+    if facts:
+        text += "\n\nThings people told me:\n" + "\n".join(f"- {f['fact']} (from <@{f['added_by']}>)" for f in facts)
+    await interaction.response.send_message(text[:1900], ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@discord_bot.tree.command(name="remember", description="Tell the bot something to remember about someone")
+@app_commands.describe(who="Who it's about", fact="What to remember")
+async def remember_command(interaction: discord.Interaction, who: discord.Member, fact: app_commands.Range[str, 3, 200]) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return
+    if learning.is_opted_out(interaction.guild.id, who.id):
+        await interaction.response.send_message(f"{who.display_name} asked me to forget them, so I can't store that.", ephemeral=True)
+        return
+
+    await learning.add_fact(interaction.guild.id, who.id, fact, interaction.user.id)
+    await interaction.response.send_message(f"Got it. I'll remember that about {who.display_name}.", ephemeral=True)
+
+
+@discord_bot.tree.command(name="forget-me", description="Delete everything the bot learned from you and stop learning from you")
+async def forget_me_command(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await learning.forget_person(interaction.guild.id, interaction.user.id)
+
+    cfg = await asyncio.to_thread(get_config)
+    if (cfg.get("learning") or {}).get("enabled"):
+        run_in_background(learning.rebuild_lore(interaction.guild.id, cfg, simple_completion, force=True, fresh=True))
+
+    await interaction.followup.send(
+        "Done. I deleted your messages, media, notes and facts about you, and I won't learn from you anymore. "
+        "My general server notes get rewritten without you in the background. Use /learn-me to opt back in.",
+        ephemeral=True,
+    )
+
+
+@discord_bot.tree.command(name="learn-me", description="Let the bot learn from your messages again")
+async def learn_me_command(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return
+
+    await learning.opt_back_in(interaction.guild.id, interaction.user.id)
+    await interaction.response.send_message("Okay, I'll learn from your messages again from now on.", ephemeral=True)
 
 
 @discord_bot.event
@@ -269,6 +372,18 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
     # Discord adds link previews (like YouTube titles) a moment after a message is sent
     if after.guild and not after.author.bot and len(after.embeds) > len(before.embeds):
         run_in_background(learning.update_media_from_embeds(after))
+
+
+@discord_bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    if payload.guild_id and discord_bot.user and payload.user_id != discord_bot.user.id:
+        run_in_background(learning.record_reaction(payload.message_id, payload.user_id, str(payload.emoji), payload.emoji.name or "", True))
+
+
+@discord_bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
+    if payload.guild_id and discord_bot.user and payload.user_id != discord_bot.user.id:
+        run_in_background(learning.record_reaction(payload.message_id, payload.user_id, str(payload.emoji), payload.emoji.name or "", False))
 
 
 @discord_bot.event
@@ -486,9 +601,16 @@ async def on_message(new_msg: discord.Message) -> None:
     # What the bot has learned from this server, plus media it may send back
     learned_text, offered_media = "", {}
     if not is_dm and new_msg.guild:
-        query = " ".join(m["content"] if isinstance(m["content"], str) else m["content"][0].get("text", "") for m in messages[:4])
+        chain_texts = [m["content"] if isinstance(m["content"], str) else m["content"][0].get("text", "") for m in messages]
+        query = " ".join(chain_texts[:4])
+
+        # Who's in this conversation: the sender, anyone they mention, and everyone in the chain
+        participant_ids = [new_msg.author.id] + [user.id for user in new_msg.mentions if not user.bot]
+        participant_ids += [int(user_id) for text in chain_texts for user_id in learning.MENTION_ID_RE.findall(text)]
+        participant_ids = [user_id for user_id in dict.fromkeys(participant_ids) if user_id != discord_bot.user.id]
+
         try:
-            learned_text, offered_media = await learning.build_context(new_msg.guild.id, query, config)
+            learned_text, offered_media = await learning.build_context(new_msg.guild.id, query, config, participant_ids)
         except Exception:
             logging.exception("Error while building learned context")
 
@@ -581,14 +703,26 @@ async def on_message(new_msg: discord.Message) -> None:
     final_text = learning.strip_media_tags(full_response)
 
     # Send a remembered gif/image/video if the model picked one it was offered
+    media_msg = None
     if chosen := learning.chosen_media(full_response, offered_media):
         reply_target = response_msgs[-1] if response_msgs else new_msg
         try:
             if media_msg := await learning.send_media(reply_target, chosen):
-                msg_nodes[media_msg.id] = MsgNode(text=f"(sent a {chosen['kind']}: {chosen['description'] or 'reaction'})", parent_msg=reply_target)
+                media_text = f"(sent a {chosen['kind']}: {chosen['description'] or 'reaction'})"
+                msg_nodes[media_msg.id] = MsgNode(text=media_text, parent_msg=reply_target)
                 logging.info(f"Sent remembered {chosen['kind']} (media ID: {chosen['id']})")
         except Exception:
             logging.exception("Error while sending remembered media")
+
+    # Remember what the bot said, so reactions and replies to it can teach it what lands
+    if not is_dm and new_msg.guild:
+        try:
+            if response_msgs and final_text:
+                await learning.record_bot_messages(new_msg.guild.id, new_msg.channel.id, [m.id for m in response_msgs], final_text)
+            if media_msg:
+                await learning.record_bot_messages(new_msg.guild.id, new_msg.channel.id, [media_msg.id], media_text)
+        except Exception:
+            logging.exception("Error while recording bot messages")
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = final_text
