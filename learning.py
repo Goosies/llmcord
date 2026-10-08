@@ -896,7 +896,9 @@ async def evolve_persona(guild_id: int, config: dict[str, Any], complete: Comple
                     "\n\n".join(sections)
                     + f"\n\nRewrite {bot_name}'s personality so it fits in with this crew. Change it gradually: keep most of the "
                     "current personality and adjust maybe 10-20% based on how people talk, what makes them laugh, and how they treat "
-                    f"{bot_name}. Lean into what landed, drop what flopped. Keep the same name and role. Write it in second person "
+                    f"{bot_name}. Lean into what landed, drop what flopped. Keep the same name. Keep it subtle and human: a real person whose traits "
+                    "show in how they talk, not in announcing them, catchphrases, or making every message about their background. "
+                    "Write it in second person "
                     "(\"You are...\"), concrete and specific (attitude, humor, how you talk, what you care about), under 150 words, "
                     "no intro, no rules about safety."
                 ),
@@ -1134,7 +1136,7 @@ async def mood_section(guild_id: int, channel_id: int, now: datetime, current_me
     label = time_of_day(now)
     lines = [f"Right now it's {now.strftime('%A')} {label} ({clock})."]
     if label == "late night":
-        lines.append("It's really late. You can act tired or call people out for still being up.")
+        lines.append("It's really late.")
 
     busy = await _adb("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND created_at > ?", (channel_id, t - 600), "one")
     previous = await _adb(
@@ -1158,7 +1160,7 @@ async def mood_section(guild_id: int, channel_id: int, now: datetime, current_me
     score = (feedback["score"] or 0) - 2 * roasts
 
     if roasts + (feedback["negative"] or 0) >= 3 and score < 0:
-        mood = "grumpy: people have been roasting you or telling you to shut up. Let it show a little (salty, defensive) without overdoing it"
+        mood = "grumpy: people have been roasting you or telling you to shut up. Let it color your tone a little (salty, defensive), don't announce it"
     elif score >= 6:
         mood = "in a great mood: your jokes have been landing. A bit more playful than usual"
     elif score >= 2:
@@ -1171,7 +1173,7 @@ async def mood_section(guild_id: int, channel_id: int, now: datetime, current_me
     if label == "late night":
         mood = f"{mood}, and tired" if mood else "tired"
     if mood:
-        lines.append(f"Your mood: {mood}.")
+        lines.append(f"Your mood: {mood}. Let it show subtly in your tone; don't narrate it.")
 
     return "\n".join(lines)
 
@@ -1442,7 +1444,7 @@ async def build_context(
     if recall_cfg.get("enabled") and (moments := await recall_moments(guild_id, query, recall_cfg, embed)):
         sections.append(
             (65, "Old moments from this server that relate to what's being said. You can call back to one like you remember it "
-             "(\"this is the reactor thing all over again\"), but only if it really fits:\n"
+             "(\"wait didn't this already happen\"), but only if it really fits:\n"
              + "\n\n".join(f"[{_ago(created_at)}]\n{text}" for created_at, text in moments))
         )
 
@@ -1453,7 +1455,7 @@ async def build_context(
             sections.append((40, roster))
 
     if feedback_cfg.get("enabled") and (hits := await get_hits(guild_id, feedback_cfg.get("show_hits", 4))):
-        sections.append((60, "Your lines that got big laughs here. That's the humor that lands; don't repeat them word for word:\n" + "\n".join(f"- {h}" for h in hits)))
+        sections.append((60, "Your lines that got big laughs here. That's the kind of humor that lands here; don't reuse the same bits or references:\n" + "\n".join(f"- {h}" for h in hits)))
 
     media_section = reaction_section = None
     if media_cfg.get("enabled") and random.random() < media_cfg.get("offer_chance", 0.4):
