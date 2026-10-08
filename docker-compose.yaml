@@ -8,3 +8,4 @@ services:
         required: false
     volumes:
       - ./:/app:ro
+      - ./data:/app/data

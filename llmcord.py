@@ -12,6 +12,7 @@ from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 
 import discord
+from discord import app_commands
 from discord.app_commands import Choice
 from discord.ext import commands
 from discord.ui import LayoutView, TextDisplay
@@ -20,6 +21,8 @@ import httpx
 from openai import AsyncOpenAI
 from PIL import Image
 import yaml
+
+import learning
 
 load_dotenv()
 
@@ -133,6 +136,44 @@ discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=No
 
 httpx_client = httpx.AsyncClient()
 
+learning.init_db()
+background_tasks = set()
+
+
+def run_in_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+async def simple_completion(prompt_messages: list[dict[str, str]]) -> str:
+    """One-off, non-streamed request to the current model (used for building server notes)."""
+    cfg = await asyncio.to_thread(get_config)
+    provider, model = curr_model.removesuffix(":vision").split("/", 1)
+    provider_config = cfg["providers"][provider]
+
+    client = AsyncOpenAI(base_url=provider_config["base_url"], api_key=provider_config.get("api_key", "sk-no-key-required"))
+    extra_body = (provider_config.get("extra_body") or {}) | (cfg["models"].get(curr_model) or {}) | {"temperature": 0.4}
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=prompt_messages,
+        stream=False,
+        extra_headers=provider_config.get("extra_headers"),
+        extra_query=provider_config.get("extra_query"),
+        extra_body=extra_body,
+    )
+    return response.choices[0].message.content or ""
+
+
+async def learn_in_background(msg: discord.Message, cfg: dict[str, Any]) -> None:
+    try:
+        result = await learning.learn_from_message(msg, cfg, httpx_client)
+        if result.lore_due:
+            await learning.rebuild_lore(msg.guild.id, cfg, simple_completion)
+    except Exception:
+        logging.exception("Error while learning from message")
+
 
 @dataclass
 class MsgNode:
@@ -179,12 +220,65 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
     return choices[:25]
 
 
+@discord_bot.tree.command(name="lore", description="See what the bot has picked up about this server")
+async def lore_command(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return
+
+    notes = await learning.get_lore(interaction.guild.id)
+    await interaction.response.send_message((notes or "Nothing yet. I need more chat to learn from.")[:1900], ephemeral=True)
+
+
+@discord_bot.tree.command(name="backfill", description="Admin: learn from this channel's past messages")
+@app_commands.describe(limit="How many past messages to read")
+async def backfill_command(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 5000] = 500) -> None:
+    cfg = await asyncio.to_thread(get_config)
+
+    if interaction.user.id not in cfg["permissions"]["users"]["admin_ids"]:
+        await interaction.response.send_message("You don't have permission to do that.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        texts, media = await learning.backfill_channel(interaction.channel, limit, cfg, httpx_client)
+    except discord.Forbidden:
+        await interaction.followup.send("I can't read this channel's history.", ephemeral=True)
+        return
+
+    if (cfg.get("learning") or {}).get("enabled"):
+        run_in_background(learning.rebuild_lore(interaction.guild.id, cfg, simple_completion))
+
+    await interaction.followup.send(f"Learned from {texts} messages and saved {media} gifs/images/videos. Updating my notes in the background.", ephemeral=True)
+
+
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config.get("client_id"):
-        logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot\n")
+        logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317240320&scope=bot\n")
 
     await discord_bot.tree.sync()
+
+
+@discord_bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+    # Discord adds link previews (like YouTube titles) a moment after a message is sent
+    if after.guild and not after.author.bot and len(after.embeds) > len(before.embeds):
+        run_in_background(learning.update_media_from_embeds(after))
+
+
+@discord_bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    run_in_background(learning.forget_messages([payload.message_id]))
+
+
+@discord_bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
+    run_in_background(learning.forget_messages(list(payload.message_ids)))
 
 
 @discord_bot.event
@@ -197,6 +291,10 @@ async def on_message(new_msg: discord.Message) -> None:
         return
 
     config = await asyncio.to_thread(get_config)
+
+    # Learn from every server message, not just ones aimed at the bot
+    if not is_dm:
+        run_in_background(learn_in_background(new_msg, config))
 
     # Random chime-ins: occasionally reply to messages that don't @ the bot
     random_cfg = config.get("random_replies") or {}
@@ -385,6 +483,15 @@ async def on_message(new_msg: discord.Message) -> None:
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}, random chime-in: {random_trigger}):\n{new_msg.content}")
 
+    # What the bot has learned from this server, plus media it may send back
+    learned_text, offered_media = "", {}
+    if not is_dm and new_msg.guild:
+        query = " ".join(m["content"] if isinstance(m["content"], str) else m["content"][0].get("text", "") for m in messages[:4])
+        try:
+            learned_text, offered_media = await learning.build_context(new_msg.guild.id, query, config)
+        except Exception:
+            logging.exception("Error while building learned context")
+
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
 
@@ -393,6 +500,7 @@ async def on_message(new_msg: discord.Message) -> None:
         if random_trigger:
             system_prompt += "\n\nNobody @'d you. You are chiming into this chat on your own. React naturally to the latest message, stay in character, and keep it to one or two short sentences."
 
+    if system_prompt := "\n\n".join(filter(None, (system_prompt, learned_text))):
         messages.append(dict(role="system", content=system_prompt))
 
     # Generate and send response message(s) (can be multiple if response is long)
@@ -449,7 +557,8 @@ async def on_message(new_msg: discord.Message) -> None:
                     is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
                     if start_next_msg or ready_to_edit or is_final_edit:
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                        shown_text = learning.strip_media_tags(response_contents[-1]) or "​"
+                        embed.description = shown_text if is_final_edit else (shown_text + STREAMING_INDICATOR)
                         embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
                         if start_next_msg:
@@ -462,13 +571,27 @@ async def on_message(new_msg: discord.Message) -> None:
 
             if use_plain_responses:
                 for content in response_contents:
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+                    if content := learning.strip_media_tags(content):
+                        await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
     except Exception:
         logging.exception("Error while generating response")
 
+    full_response = "".join(response_contents)
+    final_text = learning.strip_media_tags(full_response)
+
+    # Send a remembered gif/image/video if the model picked one it was offered
+    if chosen := learning.chosen_media(full_response, offered_media):
+        reply_target = response_msgs[-1] if response_msgs else new_msg
+        try:
+            if media_msg := await learning.send_media(reply_target, chosen):
+                msg_nodes[media_msg.id] = MsgNode(text=f"(sent a {chosen['kind']}: {chosen['description'] or 'reaction'})", parent_msg=reply_target)
+                logging.info(f"Sent remembered {chosen['kind']} (media ID: {chosen['id']})")
+        except Exception:
+            logging.exception("Error while sending remembered media")
+
     for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
+        msg_nodes[response_msg.id].text = final_text
         msg_nodes[response_msg.id].lock.release()
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache

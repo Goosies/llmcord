@@ -33,6 +33,23 @@ random_replies:
   context_messages: 8     # recent chat the bot reads before chiming in
   channel_ids: []         # empty = every channel the bot can see
 
+learning:                 # the bot picks up the server's slang, jokes and vibe from chat
+  enabled: true
+  style_samples: 12       # random real messages shown to the bot each reply, so it talks like you all
+  lore_every_messages: 200  # rebuild its notes about the server after this many new messages
+  lore_source_messages: 120 # how many recent messages those notes are built from
+  ignored_user_ids: []    # people whose messages should never be learned from
+  channel_ids: []         # empty = learn from every channel the bot can see
+
+media:                    # the bot remembers gifs/images/videos people post and can send them back
+  enabled: true
+  offer_chance: 0.4       # how often the bot gets a few to pick from when replying
+  candidates: 8           # how many options it sees each time
+  reuse_cooldown_hours: 12  # don't resend the same thing within this window
+  save_files: true        # keep copies of files uploaded to Discord (their links expire after a day)
+  max_file_mb: 8
+  max_total_mb: 1000
+
 providers:
   ollama:
     base_url: http://localhost:11434/v1
