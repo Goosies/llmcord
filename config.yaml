@@ -64,9 +64,12 @@ people:                   # notes on each person, plus facts added with /remembe
   max_in_context: 4       # how many people's notes the bot sees per reply
   roster_size: 15         # how many regulars it knows by name and ID
 
-feedback:                 # learns which of its messages land from reactions and replies
+feedback:                 # learns which of its messages land from laughs and reactions
   enabled: true
-  show_hits: 4            # how many of its best-received lines it sees as examples
+  show_hits: 0            # show its best-received lines as examples (0 = off; small models copy them word for word)
+
+anti_repeat:              # bans phrases the bot keeps reusing, and rewrites a reply once if it still repeats
+  enabled: true
 
 media:                    # the bot remembers gifs/images/videos people post and can send them back
   enabled: true

@@ -55,6 +55,8 @@ RETRY_SECONDS = 600
 HABITS_CACHE_SECONDS = 600
 MAX_MEDIA_PER_MESSAGE = 5
 FEEDBACK_DAYS = 30
+HIT_DAYS = 7
+OVERUSE_WINDOW = 40  # how many of the bot's recent messages are checked for repeats
 
 Complete = Callable[[list[dict[str, str]]], Awaitable[str]]
 Embed = Callable[[list[str], str], Awaitable[list[list[float]]]]  # (texts, "document" | "query") -> vectors
@@ -121,6 +123,7 @@ class LearnedContext:
     text: str = ""
     media: dict[int, Any] = field(default_factory=dict)
     reactions: list[str] = field(default_factory=list)
+    overused: list[str] = field(default_factory=list)
 
 
 _media_bytes: Optional[int] = None
@@ -380,7 +383,7 @@ def reply_weight(text: str) -> int:
         return -2
     if LAUGH_RE.search(text or ""):
         return 2
-    return 1
+    return 0  # a reply isn't approval: people reply to mock things too
 
 
 def _budgeted_lines(lines: list[str], budget: int) -> list[str]:
@@ -683,9 +686,10 @@ async def record_reaction(message_id: int, user_id: int, emoji: str, emoji_name:
 async def get_hits(guild_id: int, limit: int) -> list[str]:
     """The bot's best-received lines lately."""
     rows = await _adb(
-        "SELECT b.content, SUM(f.weight) AS score FROM bot_messages b JOIN feedback f ON f.message_id = b.id "
-        "WHERE b.guild_id = ? AND b.created_at > ? GROUP BY b.id HAVING score >= 2 ORDER BY score DESC LIMIT ?",
-        (guild_id, time.time() - FEEDBACK_DAYS * 86400, limit * 3),
+        "SELECT b.content, SUM(f.weight) AS score, COUNT(DISTINCT CASE WHEN f.weight > 0 THEN f.user_id END) AS fans "
+        "FROM bot_messages b JOIN feedback f ON f.message_id = b.id "
+        "WHERE b.guild_id = ? AND b.created_at > ? GROUP BY b.id HAVING score >= 3 AND fans >= 2 ORDER BY score DESC LIMIT ?",
+        (guild_id, time.time() - HIT_DAYS * 86400, limit * 3),
         "all",
     )
     return list(dict.fromkeys(row["content"] for row in rows if row["content"]))[:limit]
@@ -717,6 +721,56 @@ async def get_flops(guild_id: int, limit: int) -> list[str]:
     return list(dict.fromkeys(content for content in flops if content))[:limit]
 
 
+async def _recent_bot_texts(guild_id: int, limit: int = OVERUSE_WINDOW) -> list[str]:
+    rows = await _adb(
+        "SELECT content FROM bot_messages WHERE guild_id = ? ORDER BY created_at DESC LIMIT ?", (guild_id, limit * 3), "all"
+    )
+    texts = [row["content"] for row in rows if row["content"] and not row["content"].startswith("(sent a")]
+    return list(dict.fromkeys(texts))[:limit]  # long replies are stored once per Discord message
+
+
+def find_overused_phrases(texts: list[str], min_messages: int = 2, limit: int = 8) -> list[str]:
+    """Phrases (3-6 words) the bot has used in several different messages."""
+    counts: Counter = Counter()
+    for text in texts:
+        tokens = TOKEN_RE.findall(text.lower())
+        grams = set()
+        for size in range(3, 7):
+            for start in range(len(tokens) - size + 1):
+                gram = tokens[start : start + size]
+                if sum(1 for t in gram if t not in STOPWORDS) >= 2:
+                    grams.add(" ".join(gram))
+        counts.update(grams)
+
+    def trigrams(phrase: str) -> set[str]:
+        """Word pairs in the phrase (skipping pairs of filler words), used to spot overlapping phrases."""
+        tokens = phrase.split()
+        return {f"{a} {b}" for a, b in zip(tokens, tokens[1:]) if not (a in STOPWORDS and b in STOPWORDS)}
+
+    # Most-repeated first, longest first among ties; skip anything overlapping a phrase already picked,
+    # so one repeated sentence doesn't flood the list with overlapping fragments
+    repeated = sorted(((g, n) for g, n in counts.items() if n >= min_messages), key=lambda item: (item[1], len(item[0])), reverse=True)
+    kept: list[str] = []
+    taken: set[str] = set()
+    for gram, _ in repeated:
+        if trigrams(gram) & taken:
+            continue
+        kept.append(gram)
+        taken |= trigrams(gram)
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+async def get_overused_phrases(guild_id: int) -> list[str]:
+    return find_overused_phrases(await _recent_bot_texts(guild_id))
+
+
+def contains_overused(text: str, phrases: list[str]) -> list[str]:
+    lowered = " ".join(TOKEN_RE.findall((text or "").lower()))
+    return [phrase for phrase in phrases if phrase in lowered]
+
+
 # ---------------------------------------------------------------- speech habits
 
 
@@ -726,12 +780,13 @@ async def get_speech_habits(guild_id: int) -> str:
         return cached[1]
 
     rows = await _adb("SELECT author_id, content FROM messages WHERE guild_id = ? ORDER BY id DESC LIMIT 600", (guild_id,), "all")
-    text = compute_speech_habits([(row["author_id"], row["content"]) for row in rows])
+    bot_text = " ".join(" ".join(TOKEN_RE.findall(t.lower())) for t in await _recent_bot_texts(guild_id, 100))
+    text = compute_speech_habits([(row["author_id"], row["content"]) for row in rows], exclude_text=bot_text)
     _habits_cache[guild_id] = (time.time(), text)
     return text
 
 
-def compute_speech_habits(rows: list[tuple[int, str]]) -> str:
+def compute_speech_habits(rows: list[tuple[int, str]], exclude_text: str = "") -> str:
     texts = [(author, content) for author, content in rows if content and content.strip()]
     if len(texts) < 30:
         return ""
@@ -778,7 +833,7 @@ def compute_speech_habits(rows: list[tuple[int, str]]) -> str:
             phrase_counts[gram] += 1
             users_by_phrase.setdefault(gram, set()).add(author)
 
-    common = [p for p, n in phrase_counts.most_common(200) if n >= 4 and len(users_by_phrase[p]) >= 2]
+    common = [p for p, n in phrase_counts.most_common(200) if n >= 4 and len(users_by_phrase[p]) >= 2 and not (len(p) > 3 and p in exclude_text)]
     if common:
         lines.append("Words and phrases people here use a lot: " + ", ".join(common[:15]))
 
@@ -825,6 +880,8 @@ async def rebuild_lore(guild_id: int, config: dict[str, Any], complete: Complete
                     + f"\n\nYour current notes:\n{old_notes}\n\n"
                     "Rewrite the notes. Keep what is still true and add what is new. Cover: slang and phrases people use, "
                     "running jokes and memes, and what people talk about a lot. Only include things actually seen in the messages. "
+                    "Something only counts as a running joke if several people bring it up at different times; don't turn one-off "
+                    "comments into running jokes, and ignore people quoting or mocking the bot. "
                     "Skip anything private or sensitive (health, family problems, relationships, where people live). "
                     "Plain bullet points, under 200 words, no intro."
                 ),
@@ -898,6 +955,7 @@ async def evolve_persona(guild_id: int, config: dict[str, Any], complete: Comple
                     "current personality and adjust maybe 10-20% based on how people talk, what makes them laugh, and how they treat "
                     f"{bot_name}. Lean into what landed, drop what flopped. Keep the same name. Keep it subtle and human: a real person whose traits "
                     "show in how they talk, not in announcing them, catchphrases, or making every message about their background. "
+                    "Never give the personality catchphrases, signature lines, favorite foods, or recurring objects or topics. "
                     "Write it in second person "
                     "(\"You are...\"), concrete and specific (attitude, humor, how you talk, what you care about), under 150 words, "
                     "no intro, no rules about safety."
@@ -992,7 +1050,8 @@ async def rebuild_person(guild_id: int, user_id: int, config: dict[str, Any], co
                     "\n\n".join(sections)
                     + "\n\nRewrite your notes on this person: what they're into, running bits about them, and how they talk. "
                     "End with one line starting \"Your take:\" on how you feel about them based on how they treat you "
-                    "(shift it gradually, don't flip it overnight). Only include things supported by the messages or facts. "
+                    "(shift it gradually, don't flip it overnight). Only include things supported by the messages or facts, "
+                    "and don't turn a single comment into a running bit. "
                     "Skip anything private or sensitive (health, family problems, relationships, where they live). "
                     "Under 100 words, no intro."
                 ),
@@ -1039,6 +1098,18 @@ async def forget_person(guild_id: int, user_id: int) -> None:
     await _adb("INSERT OR IGNORE INTO optouts (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id))
     _optouts.add((guild_id, user_id))
     _habits_cache.pop(guild_id, None)
+
+
+async def reset_learning(guild_id: int) -> None:
+    """Throw away the personality, notes and feedback (keeps the chat log, media, memories and /remember facts)."""
+    await _adb("DELETE FROM persona WHERE guild_id = ?", (guild_id,))
+    await _adb("DELETE FROM lore WHERE guild_id = ?", (guild_id,))
+    await _adb("DELETE FROM people WHERE guild_id = ?", (guild_id,))
+    await _adb("DELETE FROM feedback WHERE message_id IN (SELECT id FROM bot_messages WHERE guild_id = ?)", (guild_id,))
+    await _adb("DELETE FROM bot_messages WHERE guild_id = ?", (guild_id,))
+    _habits_cache.pop(guild_id, None)
+    for key in [k for k in _last_attempt if len(k) > 1 and k[1] == guild_id]:
+        _last_attempt.pop(key, None)
 
 
 async def opt_back_in(guild_id: int, user_id: int) -> None:
@@ -1410,10 +1481,20 @@ async def build_context(
     reactions_cfg = config.get("reactions") or {}
     mood_cfg = config.get("mood") or {}
     recall_cfg = config.get("recall") or {}
+    anti_repeat_cfg = config.get("anti_repeat") or {}
 
     # (priority, text): when over budget, the lowest priority sections are dropped first
     sections: list[tuple[int, str]] = list(extra_sections or [])
     result = LearnedContext()
+
+    # Phrases the bot keeps reusing get banned, so it can't loop on its own lines
+    if anti_repeat_cfg.get("enabled", True):
+        result.overused = await get_overused_phrases(guild_id)
+        if result.overused:
+            sections.append(
+                (1000, "You've been repeating yourself. Do not use these phrases or jokes again, and don't bring up their topics "
+                 "unless someone else does: " + "; ".join(f'"{phrase}"' for phrase in result.overused))
+            )
 
     if persona_cfg.get("enabled"):
         if traits := await get_persona(guild_id, config):
@@ -1434,7 +1515,7 @@ async def build_context(
 
         if (sample_size := learn_cfg.get("style_samples", 8)) > 0:
             recent = await _adb("SELECT author_name, content FROM messages WHERE guild_id = ? ORDER BY id DESC LIMIT 400", (guild_id,), "all")
-            pool = [row for row in recent if 3 <= len(row["content"]) <= 200]
+            pool = [row for row in recent if 3 <= len(row["content"]) <= 200 and not contains_overused(row["content"], result.overused)]
             if sample := random.sample(pool, min(sample_size, len(pool))):
                 sections.append(
                     (30, "Some real messages from people here, so you talk like you belong (don't quote them back):\n"
@@ -1454,7 +1535,7 @@ async def build_context(
         if roster := await _roster_section(guild_id, people_cfg.get("roster_size", 15)):
             sections.append((40, roster))
 
-    if feedback_cfg.get("enabled") and (hits := await get_hits(guild_id, feedback_cfg.get("show_hits", 4))):
+    if feedback_cfg.get("enabled") and feedback_cfg.get("show_hits", 0) > 0 and (hits := await get_hits(guild_id, feedback_cfg["show_hits"])):
         sections.append((60, "Your lines that got big laughs here. That's the kind of humor that lands here; don't reuse the same bits or references:\n" + "\n".join(f"- {h}" for h in hits)))
 
     media_section = reaction_section = None

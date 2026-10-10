@@ -419,6 +419,24 @@ async def forget_me_command(interaction: discord.Interaction) -> None:
     )
 
 
+@discord_bot.tree.command(name="reset-learning", description="Admin: wipe the bot's personality, notes and feedback (keeps chat history)")
+async def reset_learning_command(interaction: discord.Interaction) -> None:
+    cfg = await asyncio.to_thread(get_config)
+    if interaction.user.id not in cfg["permissions"]["users"]["admin_ids"]:
+        await interaction.response.send_message("You don't have permission to do that.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return
+
+    await learning.reset_learning(interaction.guild.id)
+    await interaction.response.send_message(
+        "Reset. Personality is back to the seed, and server notes, notes on people, and reaction feedback are cleared. "
+        "Chat history, saved media, memories and /remember facts are kept. Run /backfill to rebuild notes now.",
+        ephemeral=True,
+    )
+
+
 @discord_bot.tree.command(name="learn-me", description="Let the bot learn from your messages again")
 async def learn_me_command(interaction: discord.Interaction) -> None:
     if not interaction.guild:
@@ -811,6 +829,29 @@ async def on_message(new_msg: discord.Message) -> None:
                             await response_msgs[-1].edit(embed=embed)
 
                         last_task_time = datetime.now().timestamp()
+
+            # If the reply still reuses one of its overused phrases, ask for one rewrite before sending
+            draft = "".join(response_contents)
+            if use_plain_responses and (repeats := learning.contains_overused(draft, learned.overused)):
+                try:
+                    rewrite_note = (
+                        f'Your draft reply was: "{learning.strip_media_tags(draft)}". It reuses phrases you keep repeating '
+                        f"({', '.join(repr(r) for r in repeats)}). Write a different reply to the last message that says something new "
+                        "and doesn't use those phrases or their topics. Reply with only the new message."
+                    )
+                    retry = await openai_client.chat.completions.create(
+                        model=model,
+                        messages=messages[::-1] + [dict(role="system", content=rewrite_note)],
+                        stream=False,
+                        extra_headers=extra_headers,
+                        extra_query=extra_query,
+                        extra_body=extra_body,
+                    )
+                    if new_text := (retry.choices[0].message.content or "").strip():
+                        response_contents = [new_text[i : i + max_message_length] for i in range(0, len(new_text), max_message_length)]
+                        logging.info(f"Rewrote a reply that repeated: {repeats}")
+                except Exception:
+                    logging.exception("Error while rewriting a repetitive reply")
 
             if use_plain_responses:
                 for content in response_contents:
